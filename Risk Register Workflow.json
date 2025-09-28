@@ -1,0 +1,962 @@
+{
+  "name": "Risk Register Workflow",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -816,
+        -1184
+      ],
+      "id": "c56c4c59-d2be-441b-983e-02c1efda23f4",
+      "name": "When clicking ‘Test workflow’"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract & Group — tools: zaproxy, trufflehog, securityhub, checkov, prowler, kubescape\n// Reads selected tool from Set node \"Config\" (cfg.tool)\n// Input: Jira Search items (each item.json.fields.description may be ADF)\n// Output: grouped items with combined* fields + sourceIssueKeys\n\n// ---------- config ----------\nconst cfg  = $items('Config')?.[0]?.json || {};\nconst tool = String(cfg.tool || 'zaproxy').toLowerCase();\n\n// ---------- helpers ----------\nfunction safeReplaceAll(s, f, r){ return String(s).split(f).join(r); }\nfunction cleanText(s){\n  if (s == null) return s;\n  s = String(s);\n  const repl = { \"&quot;\":'\"',\"&#x27;\":\"'\", \"&amp;\":\"&\",\"&#x2F;\":\"/\",\"&lt;\":\"<\",\"&gt;\":\">\",\"&#34;\":'\"',\"&#39;\":\"'\",\"&#44;\":\",\",\"&#46;\":\".\",\"&#58;\":\":\",\"&#59;\":\";\",\"&#63;\":\"?\" };\n  for (const [k,v] of Object.entries(repl)) s = safeReplaceAll(s,k,v);\n  return s.replace(/\\s+/g,\" \").trim();\n}\nfunction isUrlLike(s){ return !!(s && /^https?:\\/\\//i.test(s)); }\nfunction adfToText(node){\n  if (!node) return \"\";\n  if (typeof node !== \"object\") return String(node || \"\");\n  const out=[];\n  function txt(n){ let t=n.text||\"\"; for (const m of (n.marks||[])) if (m?.type===\"link\"){ const href=m.attrs?.href||\"\"; if (href && !isUrlLike(t)) t=href; } return t; }\n  function walk(n){\n    const t=n.type;\n    if (t===\"doc\"){ (n.content||[]).forEach(walk); return; }\n    if (t===\"paragraph\"){ (n.content||[]).forEach(walk); out.push(\"\\n\"); return; }\n    if (t===\"text\"){ out.push(txt(n)); return; }\n    if (t===\"hardBreak\"){ out.push(\"\\n\"); return; }\n    if (t===\"bulletList\"||t===\"orderedList\"){ (n.content||[]).forEach(walk); out.push(\"\\n\"); return; }\n    if (t===\"listItem\"){ out.push(\"- \"); (n.content||[]).forEach(walk); out.push(\"\\n\"); return; }\n    (n.content||[]).forEach(walk);\n  }\n  walk(node);\n  return out.join(\"\").replace(/\\n{3,}/g,\"\\n\\n\").trim();\n}\nfunction escRe(s){ return String(s).replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&'); }\nfunction grabLine(label,text){ const re=new RegExp(`^[*\\\\s]*${escRe(label)}[*\\\\s]*:\\\\s*(.+)$`,'im'); const m=re.exec(text); return m?m[1].trim():null; }\nfunction grabSection(startLabel,nextLabels,text){\n  const header=new RegExp(`^[*\\\\s]*${escRe(startLabel)}[*\\\\s]*:\\\\s*$`,'im');\n  const m=header.exec(text);\n  let startIdx=null;\n  if (m){ startIdx=m.index+m[0].length; }\n  else {\n    const single=new RegExp(`^[*\\\\s]*${escRe(startLabel)}[*\\\\s]*:\\\\s*(.+)$`,'im');\n    const m2=single.exec(text); return m2?m2[1].trim():null;\n  }\n  let nextPos=text.length;\n  const sub=text.slice(startIdx);\n  for (const lbl of nextLabels){\n    const hdr=new RegExp(`^[*\\\\s]*${escRe(lbl)}[*\\\\s]*:\\\\s*$`,'im');\n    const one=new RegExp(`^[*\\\\s]*${escRe(lbl)}[*\\\\s]*:\\\\s*(.+)$`,'im');\n    const mHdr=hdr.exec(sub); if (mHdr) nextPos=Math.min(nextPos,startIdx+mHdr.index);\n    const mOne=one.exec(sub); if (mOne) nextPos=Math.min(nextPos,startIdx+mOne.index);\n  }\n  const section=text.slice(startIdx,nextPos).trim();\n  return section||null;\n}\nfunction uniqJoin(list){ return Array.from(new Set(list.filter(Boolean))).join(\"\\n\\n\"); }\n\n// For “Mitigation” normalization\nfunction formatMitigation(txt){\n  if (!txt) return null;\n  const urls=[...txt.matchAll(/https?:\\/\\/[^\\s)>\\]]+/g)].map(m=>m[0]);\n  const core=txt.replace(/\\s*\\n\\s*/g,\" \").trim();\n  const parts=core.split(/(?<=[.!?])\\s+/);\n  let out=parts.filter(Boolean).join(\"\\n\\n\");\n  if (urls.length) out+=\"\\n\\n\"+urls.join(\"\\n\");\n  return out;\n}\n\n// ---------- extractors ----------\n// ZAP\nfunction extractZap(description){\n  const text=(description && typeof description===\"object\")? adfToText(description) : (description||\"\");\n  const allUrls=[...text.matchAll(/https?:\\/\\/[^\\s)>\\]]+/g)].map(m=>m[0]);\n\n  const endpointsBlock=grabSection(\"Systems/Endpoints\",[\"Description\",\"Mitigation\",\"References\",\"Site Owner\",\"Reporter\"],text);\n  const sysUrls=endpointsBlock? [...endpointsBlock.matchAll(/https?:\\/\\/[^\\s)>\\]]+/g)].map(m=>m[0]) : allUrls.slice();\n\n  let mainEndpoint=null;\n  if (sysUrls.length){ const m=sysUrls[0].match(/^https?:\\/\\/[^/]+/i); if (m) mainEndpoint=m[0]; }\n\n  const title=grabLine(\"Title\",text);\n  const severity=grabLine(\"Severity\",text);\n  const dueDate=grabLine(\"Due Date\",text);\n  const cve=grabLine(\"CVE\",text);\n  const pet=grabLine(\"Product/Engagement/Test\",text);\n  const cweM=text.match(/\\bCWE-(\\d+)\\b/);\n  let cwe=cweM?`CWE-${cweM[1]}`:null;\n  if (cwe) cwe+=` (https://cwe.mitre.org/data/definitions/${cweM[1]}.html)`;\n  let siteOwner=grabLine(\"Site Owner\",text);\n  if (siteOwner) siteOwner=siteOwner.replace(/^\\*+|\\*+$/g,\"\").trim();\n\n  const descriptionSec=grabSection(\"Description\",[\"Mitigation\",\"References\",\"Site Owner\",\"Reporter\"],text);\n  const mitigationSec =grabSection(\"Mitigation\", [\"References\",\"Site Owner\",\"Reporter\",\"Description\"],text);\n  const referencesSec =grabSection(\"References\", [\"Site Owner\",\"Reporter\",\"Description\",\"Mitigation\"],text);\n\n  return {\n    Title: cleanText(title||\"\"),\n    Severity: cleanText(severity||\"\"),\n    \"Due Date\": cleanText(dueDate||\"\"),\n    CWE: cleanText(cwe||\"\"),\n    CVE: cleanText(cve||\"\"),\n    \"Product/Engagement/Test\": cleanText(pet||\"\"),\n    \"Systems/Endpoints\": sysUrls.length? sysUrls.join(\"\\n\") : null,\n    Description: descriptionSec? cleanText(descriptionSec): null,\n    Mitigation: formatMitigation(mitigationSec),\n    References: referencesSec? cleanText(referencesSec): null,\n    \"Site Owner\": siteOwner? cleanText(siteOwner): null,\n    \"Main Endpoint\": mainEndpoint||null,\n  };\n}\n\n// Trufflehog\nfunction extractTrufflehog(description){\n  const text=(description && typeof description===\"object\")? adfToText(description) : (description||\"\");\n  const title      = grabLine(\"Title\", text);\n  const cve        = grabLine(\"CVE\", text);\n  const sourceFile = grabLine(\"Source File\", text);\n  const repoOwner  = grabLine(\"Repo Owner\", text);\n  const cweM=text.match(/\\bCWE-(\\d+)\\b/); const cwe = cweM ? `CWE-${cweM[1]} (https://cwe.mitre.org/data/definitions/${cweM[1]}.html)` : null;\n  const references = grabSection(\"References\", [\"Mitigation\",\"Impact\",\"Repo Owner\",\"Source File\",\"CWE\",\"CVE\",\"Title\"], text);\n  const mitigation = grabSection(\"Mitigation\",  [\"References\",\"Impact\",\"Repo Owner\",\"Source File\",\"CWE\",\"CVE\",\"Title\"], text);\n  const impact     = grabSection(\"Impact\",      [\"References\",\"Mitigation\",\"Repo Owner\",\"Source File\",\"CWE\",\"CVE\",\"Title\"], text);\n\n  return {\n    Title: cleanText(title||\"\"),\n    CWE: cleanText(cwe||\"\"),\n    CVE: cleanText(cve||\"\"),\n    \"Source File\": cleanText(sourceFile||\"\"),\n    \"Repo Owner\": cleanText(repoOwner||\"\"),\n    References: cleanText(references||\"\"),\n    Mitigation: formatMitigation(mitigation||\"\"),\n    Impact: cleanText(impact||\"\"),\n  };\n}\n\n// SecurityHub\nfunction extractSecurityHub(description){\n  const text=(description && typeof description===\"object\")? adfToText(description) : (description||\"\");\n  const acct   = (text.match(/\\*\\*?AwsAccountId:\\*\\*?\\s*(\\d+)/i)||[])[1] || null;\n  const genId  = (text.match(/\\*\\*?Generator ID:\\*\\*?\\s*(security-control\\/[a-z0-9.]+)/i)||[])[1] || null;\n  const region = (text.match(/\\*\\*?Region:\\*\\*?\\s*([\\w-]+)/i)||[])[1] || null;\n  const title  = (text.match(/\\*Title\\*:\\s*\\[(.*?)\\s*-\\s*Resource:/i)||[])[1] || null;\n  const sev    = (text.match(/\\*?Severity:\\*?\\s*(.*?)\\n/i)||[])[1] || null;\n  const arn    = (text.match(/\\*\\*AWS Finding ARN:\\*\\*\\s*(arn:[^\\s]+)\\s*/i)||[])[1] || null;\n\n  const impact = grabSection(\"Impact\", [\"References\",\"Mitigation\",\"Repo Owner\",\"Source File\",\"CWE\",\"CVE\",\"Title\"], text);\n  const refs   = grabSection(\"References\", [\"Impact\",\"Mitigation\",\"Repo Owner\",\"Source File\",\"CWE\",\"CVE\",\"Title\"], text);\n  const dor    = (text.match(/\\*Description\\*:\\s*([\\s\\S]*?)\\n\\*\\*AWS Finding ARN:\\*\\*/i)||[])[1] || null;\n\n  let cwe = (text.match(/\\bCWE-(\\d+)\\b/)||[])[1];\n  cwe = cwe ? `CWE-${cwe} (https://cwe.mitre.org/data/definitions/${cwe}.html)` : null;\n\n  return {\n    Title: cleanText(title||\"\"),\n    Severity: cleanText(sev||\"\"),\n    Region: cleanText(region||\"\"),\n    \"AWS Finding ARN\": cleanText(arn||\"\"),\n    \"AwsAccountId\": cleanText(acct||\"\"),\n    \"Generator ID\": cleanText(genId||\"\"),\n    Description: cleanText(dor||\"\"),\n    Impact: cleanText(impact||\"\"),\n    References: cleanText(refs||\"\"),\n    CWE: cleanText(cwe||\"\"),\n  };\n}\n\n// Checkov\nfunction extractCheckov(description){\n  const text=(description && typeof description===\"object\")? adfToText(description) : (description||\"\");\n  const title  = (text.match(/\\*Title\\*:\\s*\\[(.*?)\\|/i)||[])[1] || null;\n  const sev    = (text.match(/\\*Severity\\*:\\s*(.*?)\\n/i)||[])[1] || null;\n  const cweM   = (text.match(/\\bCWE-(\\d+)\\b/)||[])[1];\n  const cwe    = cweM ? `CWE-${cweM} (https://cwe.mitre.org/data/definitions/${cweM}.html)` : null;\n  const repo   = (text.match(/Repo\\s*Link:\\s*(https?:\\/\\/[^\\s]+)/i)||[])[1] || null;\n  const owner  = (text.match(/Repo\\s*Owner:\\s*(\\w+)/i)||[])[1] || null;\n  const src    = (text.match(/\\*Source File\\*:\\s*(\\S+)/i)||[])[1] || null;\n  const chkId  = (text.match(/Check\\s*Id:\\s*([A-Za-z0-9_]+)/i)||[])[1] || null;\n  const chkNm  = (text.match(/Check\\s*Name:\\s*(.*?)\\s*Result:/i)||[])[1] || null;\n  const refs   = (text.match(/\\*References\\*:\\s*(https?:\\/\\/[^\\s]+(?:\\s+https?:\\/\\/[^\\s]+)*)/i)||[])[1] || null;\n\n  return {\n    Title: cleanText(title||\"\"),\n    Severity: cleanText(sev||\"\"),\n    \"Repo Link\": cleanText(repo||\"\"),\n    \"Repo Owner\": cleanText(owner||\"\"),\n    \"Source File\": cleanText(src||\"\"),\n    \"Check Id\": cleanText(chkId||\"\"),\n    \"Check Name\": cleanText(chkNm||\"\"),\n    References: cleanText(refs||\"\"),\n    CWE: cleanText(cwe||\"\"),\n  };\n}\n\n// Prowler\nfunction extractProwler(description){\n  const text=(description && typeof description===\"object\")? adfToText(description) : (description||\"\");\n  const title = (text.match(/\\*Title\\*:\\s*\\[(.*?)\\|/i)||[])[1] || null;\n  const cweM  = (text.match(/\\bCWE-(\\d+)\\b/)||[])[1];\n  const cwe   = cweM ? `CWE-${cweM} (https://cwe.mitre.org/data/definitions/${cweM}.html)` : null;\n  const refs  = (text.match(/\\*References\\*:\\s*([\\s\\S]*?)\\n\\s*\\*Reporter/i)||[])[1] || null;\n  const acct  = (text.match(/\\*\\*AWS Account:\\*\\*\\s*(.*?)\\s*\\|/i)||[])[1] || null;\n  const svc   = (text.match(/\\*\\*AWS Service:\\*\\*\\s*(.*?)\\n/i)||[])[1] || null;\n  const ctrl  = (text.match(/\\*\\*Control:\\*\\*\\s*(.*?)\\n/i)||[])[1] || null;\n  const impact= (text.match(/\\*Impact\\*:\\s*(.*?)\\n/i)||[])[1] || null;\n\n  return {\n    Title: cleanText(title||\"\"),\n    CWE: cleanText(cwe||\"\"),\n    References: cleanText(refs||\"\"),\n    \"AWS Account\": cleanText(acct||\"\"),\n    \"AWS Service\": cleanText(svc||\"\"),\n    \"Control\": cleanText(ctrl||\"\"),\n    Impact: cleanText(impact||\"\"),\n  };\n}\n\n// Kubescape\nfunction extractKubescape(description){\n  const text=(description && typeof description===\"object\")? adfToText(description) : (description||\"\");\n  const title = (text.match(/\\*Title\\*:\\s*\\[(.*?)\\|/i)||[])[1] || null;\n  const owner = (text.match(/\\*\\*Repo Owner:\\*\\*\\s*(.*?)\\n/i)||[])[1] || null;\n  const repo  = (text.match(/\\*\\*Repo Link:\\*\\*\\s*(.*?)\\n/i)||[])[1] || null;\n  const dor   = (text.match(/\\*Description\\*:\\s*([\\s\\S]*?)\\s*\\*\\*resourceID:\\*\\*/i)||[])[1] || null;\n  const ctrl  = (text.match(/\\*\\*controlID:\\*\\*\\s*(.*?)\\n/i)||[])[1] || null;\n  const resid = (text.match(/\\*\\*resourceID:\\*\\*\\s*(.*?)\\n/i)||[])[1] || null;\n\n  let ctrlLink = ctrl ? `${ctrl.trim().toUpperCase()} (https://hub.armosec.io/docs/${ctrl.trim().toLowerCase()})` : null;\n\n  return {\n    Title: cleanText(title||\"\"),\n    \"Repo Owner\": cleanText(owner||\"\"),\n    \"Repo Link\": cleanText(repo||\"\"),\n    \"Description of Risk\": cleanText(dor||\"\"),\n    \"Control ID\": cleanText(ctrlLink||\"\"),\n    \"Resource ID\": cleanText(resid||\"\"),\n  };\n}\n\n// ---------- main (per tool) ----------\nconst results = [];\n\nif (tool === 'trufflehog') {\n  // group: Repo Owner + Source File\n  const parsed = items.map(it => {\n    const issue = it.json || {};\n    const fields = issue.fields || {};\n    return { issue, ext: extractTrufflehog(fields.description || null) };\n  });\n\n  const groups = new Map();\n  for (const {issue, ext} of parsed) {\n    const owner = ext[\"Repo Owner\"];\n    const file  = ext[\"Source File\"];\n    const title = ext[\"Title\"];\n    if (owner && file && title) {\n      const gk = `${owner}|||${file}`;\n      if (!groups.has(gk)) groups.set(gk, { info: ext, keys: [] });\n      groups.get(gk).keys.push(issue.key || issue.id);\n    }\n  }\n\n  for (const [gk,{info,keys}] of groups.entries()) {\n    const [owner,file] = gk.split(\"|||\");\n    const allCWE=[], allDesc=[], allMit=[], allRef=[];\n    for (const {issue,ext} of parsed) {\n      if (ext[\"Repo Owner\"]===owner && ext[\"Source File\"]===file) {\n        if (ext.CWE) allCWE.push(ext.CWE);\n        const parts = [ext.Title, ext.Impact].filter(Boolean).join(\"\\n\\n\");\n        if (parts) allDesc.push(`Ticket ${issue.key}:\\n\\n${parts}`);\n        if (ext.Mitigation) allMit.push(ext.Mitigation);\n        if (ext.References) allRef.push(`Ticket ${issue.key}:\\n\\n${ext.References}`);\n      }\n    }\n\n    results.push({\n      json: {\n        summary: `${owner} - ${file}`,\n        site_owner_sanitized: owner.replace(/\\s+/g,\"-\"),\n        combinedCWEs: uniqJoin(allCWE),                         // → TVI\n        combinedDescriptions: uniqJoin(allDesc),                // → Description & DOR\n        combinedMitigations: uniqJoin(allMit),\n        combinedReferencesWithTicket: uniqJoin(allRef),         // → References\n        risk_source: file || \"\",                                // → Risk Identification Source\n        asset_urls: file || \"\",                                 // → Asset(s) Affected\n        sourceIssueKeys: keys\n      }\n    });\n  }\n  return results;\n}\n\nif (tool === 'securityhub') {\n  // group: Account + Generator ID\n  const parsed = items.map(it => {\n    const issue = it.json || {};\n    const fields = issue.fields || {};\n    return { issue, ext: extractSecurityHub(fields.description || null) };\n  });\n\n  const groups = new Map();\n  for (const {issue,ext} of parsed) {\n    const acct = ext[\"AwsAccountId\"], gen = ext[\"Generator ID\"];\n    if (acct && gen) {\n      const gk = `${acct}|||${gen}`;\n      if (!groups.has(gk)) groups.set(gk, { info: ext, keys: [] });\n      groups.get(gk).keys.push(issue.key || issue.id);\n    }\n  }\n\n  for (const [gk,{info,keys}] of groups.entries()) {\n    const [acct,gen] = gk.split(\"|||\");\n    const allCWE=[], allDesc=[], allRefs=[];\n    for (const {issue,ext} of parsed) {\n      if (ext[\"AwsAccountId\"]===acct && ext[\"Generator ID\"]===gen) {\n        if (ext.CWE) allCWE.push(ext.CWE);\n        const parts = [ext.Title, ext.Impact].filter(Boolean).join(\"\\n\\n\");\n        if (parts) allDesc.push(`Ticket ${issue.key}:\\n\\n${parts}`);\n        if (ext.References) allRefs.push(`Ticket ${issue.key}:\\n\\n${ext.References}`);\n      }\n    }\n\n    results.push({\n      json: {\n        summary: `${info.Title || ''} - Account-ID: ${acct} - Region: ${info.Region || ''} - Finding: ${gen}`,\n        site_owner_sanitized: (acct || \"\").toString(),\n        combinedCWEs: uniqJoin(allCWE),                         // → TVI\n        combinedDescriptions: uniqJoin(allDesc),                // → Description & DOR\n        combinedReferencesWithTicket: uniqJoin(allRefs),        // → References\n        risk_source: info[\"AWS Finding ARN\"] || \"\",             // → Risk Identification Source\n        asset_urls: \"\",                                         // optional\n        sourceIssueKeys: keys\n      }\n    });\n  }\n  return results;\n}\n\nif (tool === 'checkov') {\n  // group: Repo Link + Check Id (stable)\n  const parsed = items.map(it => {\n    const issue = it.json || {};\n    const fields = issue.fields || {};\n    return { issue, ext: extractCheckov(fields.description || null) };\n  });\n\n  const groups = new Map();\n  for (const {issue,ext} of parsed) {\n    const repo = ext[\"Repo Link\"], chkId = ext[\"Check Id\"], owner = ext[\"Repo Owner\"];\n    if (repo && chkId) {\n      const gk = `${repo}|||${chkId}`;\n      if (!groups.has(gk)) groups.set(gk, { info: { ...ext, owner }, keys: [] });\n      groups.get(gk).keys.push(issue.key || issue.id);\n    }\n  }\n\n  for (const [gk,{info,keys}] of groups.entries()) {\n    const [repo, chkId] = gk.split(\"|||\");\n    const allCWE=[], allDesc=[], allRefs=[];\n    for (const {issue,ext} of parsed) {\n      if (ext[\"Repo Link\"]===repo && ext[\"Check Id\"]===chkId) {\n        if (ext.CWE) allCWE.push(ext.CWE);\n        const parts = [ext[\"Check Name\"] || info[\"Title\"], info[\"Severity\"]].filter(Boolean).join(\"\\n\\n\");\n        if (parts) allDesc.push(`Ticket ${issue.key}:\\n\\n${parts}`);\n        if (ext.References) allRefs.push(`Ticket ${issue.key}:\\n\\n${ext.References}`);\n      }\n    }\n\n    results.push({\n      json: {\n        summary: `${info[\"Repo Owner\"] || 'Repo'} - ${info[\"Check Name\"] || chkId}`,\n        site_owner_sanitized: (info[\"Repo Owner\"] || \"\").replace(/\\s+/g,\"-\"),\n        combinedCWEs: uniqJoin(allCWE),                         // → TVI\n        combinedDescriptions: uniqJoin(allDesc),\n        combinedReferencesWithTicket: uniqJoin(allRefs),\n        risk_source: repo || \"\",                                // → Risk Identification Source\n        asset_urls: info[\"Source File\"] || \"\",                  // → Asset(s) Affected\n        sourceIssueKeys: keys\n      }\n    });\n  }\n  return results;\n}\n\nif (tool === 'prowler') {\n  // group: AWS Account + Control\n  const parsed = items.map(it => {\n    const issue = it.json || {};\n    const fields = issue.fields || {};\n    return { issue, ext: extractProwler(fields.description || null) };\n  });\n\n  const groups = new Map();\n  for (const {issue,ext} of parsed) {\n    const acct = ext[\"AWS Account\"], ctrl = ext[\"Control\"];\n    if (acct && ctrl) {\n      const gk = `${acct}|||${ctrl}`;\n      if (!groups.has(gk)) groups.set(gk, { info: ext, keys: [] });\n      groups.get(gk).keys.push(issue.key || issue.id);\n    }\n  }\n\n  for (const [gk,{info,keys}] of groups.entries()) {\n    const [acct, ctrl] = gk.split(\"|||\");\n    const allCWE=[], allDesc=[], allRefs=[];\n    for (const {issue,ext} of parsed) {\n      if (ext[\"AWS Account\"]===acct && ext[\"Control\"]===ctrl) {\n        if (ext.CWE) allCWE.push(ext.CWE);\n        if (ext.Impact) allDesc.push(`Ticket ${issue.key}:\\n\\n${ext.Impact}`);\n        if (ext.References) allRefs.push(`Ticket ${issue.key}:\\n\\n${ext.References}`);\n      }\n    }\n\n    results.push({\n      json: {\n        summary: `Prowler Alert - ${acct} - ${ctrl}`,\n        site_owner_sanitized: (acct || \"\").toString(),\n        combinedCWEs: uniqJoin(allCWE),                         // → TVI\n        combinedDescriptions: uniqJoin(allDesc),\n        combinedReferencesWithTicket: uniqJoin(allRefs),\n        risk_source: info[\"AWS Service\"] || \"\",                 // → Risk Identification Source\n        asset_urls: \"\",                                         // optional\n        sourceIssueKeys: keys\n      }\n    });\n  }\n  return results;\n}\n\nif (tool === 'kubescape') {\n  // group: Control ID + Repo Link (stable)\n  const parsed = items.map(it => {\n    const issue  = it.json || {};\n    const fields = issue.fields || {};\n    return { issue, ext: extractKubescape(fields.description || null) };\n  });\n\n  const groups = new Map();\n  for (const { issue, ext } of parsed) {\n    const ctrl = ext[\"Control ID\"];\n    const repo = ext[\"Repo Link\"];\n    if (ctrl && repo) {\n      const gk = `${ctrl}|||${repo}`;\n      if (!groups.has(gk)) groups.set(gk, { info: ext, keys: [] });\n      groups.get(gk).keys.push(issue.key || issue.id);\n    }\n  }\n\n  // single-line + cap to keep Jira summary tidy\n  const oneLineCap = (s, max = 160) => {\n    if (!s) return \"\";\n    const flat = String(s).replace(/\\s+/g, \" \").trim();\n    return flat.length > max ? flat.slice(0, max - 3) + \"...\" : flat;\n  };\n\n  for (const [gk, { info, keys }] of groups.entries()) {\n    const [ctrl, repo] = gk.split(\"|||\");\n\n    // Build deduped, ticket-free content for Kubescape\n    const descOnly = [];     // pure descriptions (no ticket prefixes)\n    const controls = [];     // pure control IDs (mitigating controls), no ticket prefixes\n    const tviList  = [];     // also keep control IDs here for TVI\n\n    for (const { issue, ext } of parsed) {\n      if (ext[\"Control ID\"] === ctrl && ext[\"Repo Link\"] === repo) {\n        if (ext[\"Description of Risk\"]) descOnly.push(ext[\"Description of Risk\"]);\n        if (ext[\"Control ID\"]) { controls.push(ext[\"Control ID\"]); tviList.push(ext[\"Control ID\"]); }\n      }\n    }\n\n    // SUMMARY: \"Kubescape Alert - <repo> - <combined description (once)>\" (no Ticket / no Control ID)\n    const combinedDescOnce = uniqJoin(descOnly);\n    const summaryTail      = oneLineCap(combinedDescOnce || info[\"Title\"] || \"\");\n    const summary          = `Kubescape Alert - ${repo} - ${summaryTail}`;\n\n    results.push({\n      json: {\n        summary,\n        site_owner_sanitized: (info[\"Repo Owner\"] || \"\").replace(/\\s+/g, \"-\"),\n\n        // Control IDs remain in TVI as requested\n        combinedCWEs: uniqJoin(tviList),\n\n        // Description of Risk: deduped & ticket-free\n        combinedDescriptions: uniqJoin(descOnly),\n\n        // Mitigating Controls: use Control IDs here too, deduped & ticket-free\n        combinedReferencesWithTicket: uniqJoin(controls),\n\n        risk_source: info[\"Repo Link\"] || \"\",     // Risk Identification Source\n        asset_urls: info[\"Resource ID\"] || \"\",    // Asset(s) Affected\n        sourceIssueKeys: keys\n      }\n    });\n  }\n  return results;\n}\n\n\n// default: ZAP\n{\n  const groups=new Map();\n  for (const it of items){\n    const issue=it.json||{}, fields=issue.fields||{}, desc=fields.description||null;\n    const ext=extractZap(desc);\n    const ep=ext[\"Main Endpoint\"], owner=ext[\"Site Owner\"];\n    if (ep && owner){ const k=`${ep}|||${owner}`; if (!groups.has(k)) groups.set(k,{info:ext,keys:[]}); groups.get(k).keys.push(issue.key||issue.id); }\n  }\n\n  for (const [k,{info,keys}] of groups.entries()){\n    const [ep,owner]=k.split(\"|||\");\n    const allCWE=[], allDesc=[], allMit=[], allRef=[];\n    for (const it of items){\n      const issue=it.json||{}, f=issue.fields||{}, ext=extractZap(f.description||null);\n      if (ext[\"Main Endpoint\"]===ep && ext[\"Site Owner\"]===owner){\n        if (ext.CWE) allCWE.push(ext.CWE);\n        if (ext.Description) allDesc.push(`Ticket ${issue.key}:\\n\\n${ext.Description}`);\n        if (ext.Mitigation)  allMit.push(ext.Mitigation);\n        if (ext.References)  allRef.push(`Ticket ${issue.key}:\\n\\n${ext.References}`);\n      }\n    }\n    results.push({\n      json:{\n        summary: `${ep} - ${owner}`,\n        site_owner_sanitized: owner.replace(/\\s+/g,\"-\"),\n        combinedCWEs: uniqJoin(allCWE),\n        combinedDescriptions: uniqJoin(allDesc),\n        combinedMitigations: uniqJoin(allMit),\n        combinedReferencesWithTicket: uniqJoin(allRef),\n        risk_source: info[\"Product/Engagement/Test\"] || \"\",\n        asset_urls: info[\"Systems/Endpoints\"] || \"\",\n        sourceIssueKeys: keys\n      }\n    });\n  }\n  return results;\n}\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        -1184
+      ],
+      "id": "d2cae906-bfaf-48ae-af3c-8d593b121d31",
+      "name": "Extract&Group",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a4515952-f21d-406d-8b4f-0ee9adf74c3d",
+              "name": "idx",
+              "value": "={{$itemIndex}}",
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        304,
+        -1184
+      ],
+      "id": "ba234fb6-c667-4b25-8297-63e80eb29729",
+      "name": "Tag Index"
+    },
+    {
+      "parameters": {
+        "project": {
+          "__rl": true,
+          "value": "10006",
+          "mode": "list",
+          "cachedResultName": "Dev-SEC-RR"
+        },
+        "issueType": {
+          "__rl": true,
+          "value": "10035",
+          "mode": "list",
+          "cachedResultName": "Story"
+        },
+        "summary": "={{ $json.fields.summary }}",
+        "additionalFields": {
+          "customFieldsUi": {
+            "customFieldsValues": [
+              {
+                "fieldId": {
+                  "__rl": true,
+                  "value": "customfield_10063",
+                  "mode": "list",
+                  "cachedResultName": "Risk Identification Source"
+                },
+                "fieldValue": "={{ $json.fields.customfield_10063 }}"
+              },
+              {
+                "fieldId": {
+                  "__rl": true,
+                  "value": "customfield_10065",
+                  "mode": "list",
+                  "cachedResultName": "Asset(s) Affected"
+                },
+                "fieldValue": "={{ $json.fields.customfield_10065 }}"
+              },
+              {
+                "fieldId": {
+                  "__rl": true,
+                  "value": "customfield_10066",
+                  "mode": "list",
+                  "cachedResultName": "Description Of Risk"
+                },
+                "fieldValue": "={{ $json.fields.customfield_10066 }}"
+              },
+              {
+                "fieldId": {
+                  "__rl": true,
+                  "value": "customfield_10064",
+                  "mode": "list",
+                  "cachedResultName": "Threat and Vulnerability Information"
+                },
+                "fieldValue": "={{ $json.fields.customfield_10064 }}"
+              },
+              {
+                "fieldId": {
+                  "__rl": true,
+                  "value": "customfield_10067",
+                  "mode": "list",
+                  "cachedResultName": "Mitigating Controls"
+                },
+                "fieldValue": "={{ $json.fields[\"customfield_10067\"] }}"
+              }
+            ]
+          },
+          "labels": "={{ $json.fields.labels }}"
+        }
+      },
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1872,
+        -848
+      ],
+      "id": "dc9aeb20-ca7c-428b-b27d-7961d71ee6af",
+      "name": "Create Grouped Issue (RRD)",
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "b50v6lNF0s5upqH3",
+          "name": "JiraAPI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "18c5a488-7ea1-4669-84ec-0ae7f24165cb",
+              "name": "idx",
+              "value": "={{$itemIndex}}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2096,
+        -848
+      ],
+      "id": "fa65211a-4d15-46b3-bb3f-b7f1301c45b3",
+      "name": "Tag Created Index"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "sourceIssueKeys",
+        "include": "allOtherFields",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        2544,
+        -1328
+      ],
+      "id": "47447e2e-6790-4980-9732-024da60aff53",
+      "name": "Split Out"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://cloudranger3.atlassian.net/rest/api/2/issueLink",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "jiraSoftwareCloudApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"type\": { \"name\": \"Relates\" },\n  \"inwardIssue\": { \"key\": \"{{$json.rrdKey}}\" },\n  \"outwardIssue\": { \"key\": \"{{$json.sourceKey}}\" }\n}\n",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3216,
+        -1168
+      ],
+      "id": "d3856a77-5275-4f74-baff-4827d33e0686",
+      "name": "Link Tickets",
+      "alwaysOutputData": true,
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "b50v6lNF0s5upqH3",
+          "name": "JiraAPI"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "options": {
+          "jql": "={{ $json.jql }}"
+        }
+      },
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        752,
+        -896
+      ],
+      "id": "05bcd1dd-5184-41d5-8f79-58807d0b8e8c",
+      "name": "Check RRD",
+      "alwaysOutputData": true,
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "b50v6lNF0s5upqH3",
+          "name": "JiraAPI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "78164b70-914f-40bb-b161-c7fe84911653",
+              "leftValue": "={{$json.exists}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1424,
+        -976
+      ],
+      "id": "39395890-8c3c-411f-947c-96c06207d737",
+      "name": "IF (Exists?)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Create Update Payload (seed Description only if blank; cap refs; carry keys; multi-tool incl. Kubescape)\n// In #1: issues from \"Get an issue\" (RRD)\n// In #2: optional Set { forceUpdate: true }\n// Reads grouped data from node named EXACTLY \"Decide_Update/Create\"\n\nconst FORCE_UPDATE_DEFAULT = false;\nconst toggleInput = $input.all(1);\nconst FORCE_UPDATE = (toggleInput[0]?.json?.forceUpdate ?? FORCE_UPDATE_DEFAULT) === true;\n\nconst existingItems = $input.all();\nconst decideItems   = ($items(\"Decide_Update/Create\") || []).map(i => i.json || {});\n\nconst byExistingKey = new Map();\nconst bySummary     = new Map();\nfor (const d of decideItems) {\n  if (d?.existingKey) byExistingKey.set(String(d.existingKey), d);\n  if (d?.summary)     bySummary.set(String(d.summary), d);\n}\n\n// ---------- helpers ----------\nconst sameText = (a, b) => String(a ?? \"\").trim() === String(b ?? \"\").trim();\n\nconst sameArray = (a = [], b = []) => {\n  if (a.length !== b.length) return false;\n  const A = [...a].sort(), B = [...b].sort();\n  for (let i = 0; i < A.length; i++) if (A[i] !== B[i]) return false;\n  return true;\n};\n\nconst combineBlocks = (a, b) => {\n  const A = String(a || \"\").split(/\\n{2,}/).map(s => s.trim()).filter(Boolean);\n  const B = String(b || \"\").split(/\\n{2,}/).map(s => s.trim()).filter(Boolean);\n  const set = new Set([...A, ...B]);\n  return Array.from(set).join(\"\\n\\n\");\n};\n\nconst includeText = (obj, key, newVal, oldVal) => {\n  if (!newVal) return; // don't wipe Jira\n  if (FORCE_UPDATE || !sameText(newVal, oldVal)) obj[key] = newVal;\n};\n\n// Canonical labels (includes Kubescape)\nfunction normalizeLabel(s) {\n  if (!s) return null;\n  const canon = {\n    trufflehog: \"Trufflehog\",\n    zaproxy: \"Zaproxy\",\n    securityhub: \"SecurityHub\",\n    checkov: \"Checkov\",\n    prowler: \"Prowler\",\n    kubescape: \"Kubescape\",\n  };\n  const t = String(s).trim(); if (!t) return null;\n  const key = t.toLowerCase();\n  return canon[key] || t;\n}\n\nfunction uniqLabelsCaseInsensitive(arr) {\n  const seen = new Set(), out = [];\n  for (const raw of arr) {\n    const norm = normalizeLabel(raw);\n    if (!norm) continue;\n    const k = norm.toLowerCase();\n    if (seen.has(k)) continue;\n    seen.add(k); out.push(norm);\n  }\n  return out;\n}\n\n// Detect tool by summary/content (adds Kubescape)\nfunction toolLabelForGroup(grp) {\n  const sum = String(grp?.summary || \"\");\n  const desc = String(grp?.combinedDescriptions || \"\");\n  const refs = String(grp?.combinedReferencesWithTicket || \"\");\n  const tvi  = String(grp?.combinedCWEs || \"\");\n\n  if (/^\\s*Kubescape\\s*Alert/i.test(sum) || /kubescape/i.test(desc) || /kubescape/i.test(refs)) return \"Kubescape\";\n  if (/^\\s*Prowler\\s*Alert/i.test(sum) || /prowler/i.test(desc) || /prowler/i.test(refs)) return \"Prowler\";\n  if (/^\\s*https?:\\/\\//i.test(sum)) return \"Zaproxy\";\n  if (/securityhub/i.test(sum) || /security-control\\//i.test(desc) || /security-control\\//i.test(refs)) return \"SecurityHub\";\n  if (/ckv[-_]/i.test(desc) || /checkov/i.test(sum) || /checkov/i.test(refs)) return \"Checkov\";\n  if (/trufflehog/i.test(desc) || /trufflehog/i.test(refs)) return \"Trufflehog\";\n  return \"Trufflehog\";\n}\n\n// Soft-cap to Jira’s CF text limit (32,767)\nfunction capText(str, max = 32767) {\n  const s = String(str || \"\");\n  if (s.length <= max) return { text: s, truncated: false };\n  const paras = s.split(/\\n{2,}/);\n  let cur = \"\";\n  for (const p of paras) {\n    const trial = cur ? (cur + \"\\n\\n\" + p) : p;\n    if (trial.length + 3 > max) break;\n    cur = trial;\n  }\n  if (!cur) return { text: s.slice(0, max - 3) + \"...\", truncated: true };\n  return { text: cur + \"...\", truncated: true };\n}\n\n// Description template (seed only when Jira Description is blank)\nconst DESC_TEMPLATE = \"Likelihood/Probability:\\nImpact/Severity:\\nResidual Risk:\";\n\nconst out = [];\n\nfor (const it of existingItems) {\n  const ex      = it.json || {};\n  const key     = ex.key;\n  const fields  = ex.fields || {};\n  const summary = fields.summary || \"\";\n\n  const grp = byExistingKey.get(String(key)) || bySummary.get(String(summary));\n  if (!grp) continue;\n\n  // current Jira\n  const exDesc   = fields.description || \"\";\n  const exDOR    = fields.customfield_10066 || \"\"; // Description of Risk\n  const exRefs   = fields.customfield_10067 || \"\"; // References\n  const exRisk   = fields.customfield_10063 || \"\"; // Risk Identification Source\n  const exAssets = fields.customfield_10065 || \"\"; // Asset(s) Affected\n  const exTVI    = fields.customfield_10064 || \"\"; // Threat & Vulnerability Info\n  const exLabels = fields.labels || [];\n\n  // new merged (note: Description is handled specially below)\n  const newDOR     = combineBlocks(exDOR,  grp.combinedDescriptions || \"\");\n  const refsMerged = combineBlocks(exRefs,  grp.combinedReferencesWithTicket || \"\");\n  const newRisk    = grp.risk_source || \"\";\n  const newAssets  = combineBlocks(exAssets, grp.asset_urls || \"\");\n  const newTVI     = combineBlocks(exTVI, grp.combinedCWEs || \"\");\n\n  // Seed Description ONLY if Jira's Description is blank; otherwise leave it as-is\n  const shouldSeedDesc = String(exDesc || \"\").trim().length === 0;\n  const descToWrite    = shouldSeedDesc ? DESC_TEMPLATE : null; // null means \"don't touch\"\n\n  // CAP References to avoid 400\n  const refsSafe   = capText(refsMerged, 32767).text;\n\n  // labels\n  const ownerLabel = String(grp.site_owner_sanitized || \"\").trim() || null;\n  const toolLabel  = toolLabelForGroup(grp);\n  const newLabels  = uniqLabelsCaseInsensitive([ ...exLabels, ownerLabel, toolLabel ]);\n\n  // change detection\n  let changed = false;\n  if (shouldSeedDesc && !sameText(DESC_TEMPLATE, exDesc)) changed = true; // only consider desc if we're seeding\n  if (!sameText(newDOR,  exDOR))  changed = true;\n  if (!sameText(refsSafe, exRefs)) changed = true; // compare with capped refs\n  if (newRisk && !sameText(newRisk, exRisk)) changed = true;\n  if (!sameText(newAssets, exAssets)) changed = true;\n  if (!sameText(newTVI, exTVI)) changed = true;\n  if (!sameArray(newLabels, exLabels)) changed = true;\n\n  if (!FORCE_UPDATE && !changed) continue;\n\n  // build update\n  const updateFields = {};\n  if (shouldSeedDesc) {\n    includeText(updateFields, \"description\", descToWrite, exDesc); // seed template\n  } // else: leave Description untouched, by design\n\n  includeText(updateFields, \"customfield_10066\",  newDOR,    exDOR);\n  includeText(updateFields, \"customfield_10067\",  refsSafe,  exRefs); // capped\n  includeText(updateFields, \"customfield_10063\",  newRisk,   exRisk);\n  includeText(updateFields, \"customfield_10065\",  newAssets, exAssets);\n  includeText(updateFields, \"customfield_10064\",  newTVI,    exTVI);\n\n  if (FORCE_UPDATE || !sameArray(newLabels, exLabels)) {\n    updateFields.labels = newLabels;\n  }\n\n  if (Object.keys(updateFields).length === 0) continue;\n\n  // carry-through metadata for downstream (e.g., link back to sources)\n  const carriedSourceKeys = Array.isArray(grp.sourceIssueKeys) ? grp.sourceIssueKeys : [];\n\n  out.push({\n    json: {\n      issueKey: key,          // used by Jira Update node\n      fields: updateFields,   // used by Jira Update node\n\n      // carry-through meta (not read by Jira)\n      rrdKey: key,\n      sourceIssueKeys: carriedSourceKeys,\n      toolLabel,\n      summary\n    }\n  });\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2096,
+        -1072
+      ],
+      "id": "5d345804-6801-439a-97c1-5f9fe3e7299d",
+      "name": "Create Update Payload"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f2916826-f93c-446c-a60f-3f045e52b872",
+              "name": "fields.project.key",
+              "value": "RRD",
+              "type": "string"
+            },
+            {
+              "id": "d10c6611-21ef-4a86-91b1-21e56cbe7a8f",
+              "name": "fields.issuetype.name",
+              "value": "Story",
+              "type": "string"
+            },
+            {
+              "id": "06d004e8-43d3-4b5e-840f-e444b276a8e2",
+              "name": "fields.summary",
+              "value": "={{ $json.summary }}",
+              "type": "string"
+            },
+            {
+              "id": "935b68e0-ec37-4a24-8c78-58730282ba59",
+              "name": "fields.labels",
+              "value": "={{ [$json.site_owner_sanitized,$json.toolLabel ].filter(Boolean) }}",
+              "type": "array"
+            },
+            {
+              "id": "b3973400-f4d2-4ddd-953f-aa045df1e3b2",
+              "name": "fields.description",
+              "value": "\" \"",
+              "type": "string"
+            },
+            {
+              "id": "c1a04011-f62a-4daa-b4e7-5f3852ad78b4",
+              "name": "fields.customfield_10063",
+              "value": "={{ $json.risk_source || undefined }}",
+              "type": "string"
+            },
+            {
+              "id": "f327c2e7-9fc3-4d2c-a8b1-9e211f12544b",
+              "name": "fields.customfield_10064",
+              "value": "={{ $json.combinedCWEs || $json.threat_vuln || undefined }}",
+              "type": "string"
+            },
+            {
+              "id": "fb71ee50-b16e-415e-9aab-6caf05221a8d",
+              "name": "fields.customfield_10065",
+              "value": "={{ $json.asset_urls || undefined }}",
+              "type": "string"
+            },
+            {
+              "id": "24206f17-f65b-423b-b433-a105c7f5bccc",
+              "name": "fields.customfield_10066",
+              "value": "={{ $json.combinedDescriptions || undefined }}",
+              "type": "string"
+            },
+            {
+              "id": "5fd400ea-4bd6-4925-8500-11f7ae052860",
+              "name": "fields.customfield_10067",
+              "value": "={{ $json.combinedReferencesWithTicket || undefined }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1648,
+        -848
+      ],
+      "id": "33366c1a-4ea7-4591-a632-d45bf936ce1d",
+      "name": "Prepare Create Fields"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2992,
+        -1168
+      ],
+      "id": "20b35fd0-f12b-4ed6-a964-ee22ab24b36d",
+      "name": "Merge2"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e08c65a9-472c-4e0e-af01-f60946eda54c",
+              "name": "rrdKey",
+              "value": "={{$json.issueKey}}",
+              "type": "string"
+            },
+            {
+              "id": "14920278-6f54-49de-90ce-0bf6b1d241e5",
+              "name": "sourceKey",
+              "value": "={{ $json.sourceIssueKeys }}",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2768,
+        -1072
+      ],
+      "id": "7ce6ab86-9c4b-4603-9724-9921ba9d2317",
+      "name": "rrdKey(Update)"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "18c5a488-7ea1-4669-84ec-0ae7f24165cb",
+              "name": "rrdKey",
+              "value": "={{ $json.key || $json.issueKey || $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "a1113a74-14fb-4a8b-a175-127f101ab42f",
+              "name": "sourceKey",
+              "value": "={{ $json.sourceIssueKeys }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2768,
+        -1328
+      ],
+      "id": "40a5ca35-101f-4f31-9631-bd7878c2ce8b",
+      "name": "rrdKey(Create)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decide Update/Create (ROBUST)\n// - Groups from \"Tag Index\" (else falls back to $input)\n// - RRD issues from a Jira node named EXACTLY \"Check RRD\"\n// - Emits: { ...group, exists, existingKey }\n\nfunction got(name) {\n  try {\n    const arr = $items(name);\n    return Array.isArray(arr) ? arr.map(i => i.json || {}) : [];\n  } catch { return []; }\n}\n\nconst groups = got(\"Tag Index\").length ? got(\"Tag Index\") : ($input.all() || []).map(i => i.json || {});\nconst searchIssues = got(\"Check RRD\")\n  .filter(it => (it.key || it.id) && (it.fields?.summary || it.summary));\n\nconst norm = s => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();\nconst newer = (a, b) => {\n  const an = Number(String(a.id || '').replace(/\\D/g, ''));\n  const bn = Number(String(b.id || '').replace(/\\D/g, ''));\n  return (!Number.isNaN(an) && !Number.isNaN(bn)) ? (an >= bn ? a : b) : a;\n};\n\n// Exact-summary lookup (normalized)\nconst bySummary = new Map();\nfor (const issue of searchIssues) {\n  const s = issue.fields?.summary ?? issue.summary ?? '';\n  const n = norm(s);\n  if (!n) continue;\n  const prev = bySummary.get(n);\n  bySummary.set(n, prev ? newer(issue, prev) : issue);\n}\n\n// --- Robust tokenization ---\n// We split on \" - \" into segments and match all non-empty tokens against candidates.\n// Special cases:\n//  - ZAP: left is URL → reduce to host token\n//  - Prowler: summary starts with \"Prowler Alert - \" → ignore that banner segment\nfunction segmentsFromSummary(summary) {\n  const raw = String(summary || '');\n  const parts = raw.split(/\\s-\\s/).map(p => p.trim()).filter(Boolean);\n\n  // ZAP: if first part looks like URL, reduce to host\n  if (/^https?:\\/\\//i.test(parts[0] || '')) {\n    const host = parts[0].replace(/^https?:\\/\\//i, '').replace(/\\/.*$/, '');\n    parts[0] = host;\n  }\n\n  // Prowler: drop the banner \"Prowler Alert\"\n  if (/^prowler\\s*alert$/i.test(parts[0] || '')) {\n    parts.shift(); // remove \"Prowler Alert\"\n  }\n\n  // Kubescape: drop the banner \"Kubescape Alert\"\n  if (/^kubescape\\s*alert$/i.test(parts[0] || '')) {\n    parts.shift();\n  }\n\n  // Split remaining parts further on whitespace to be resilient, but keep short phrases together\n  // Heuristic: emit tokens that are at least 2 chars, ignoring punctuation-only\n  const tokens = [];\n  for (const p of parts) {\n    const t = p.replace(/[^\\p{L}\\p{N}\\-_/.: ]+/gu, ' ').trim(); // keep typical chars\n    const bits = t.split(/\\s+/).filter(Boolean);\n    // prefer the whole segment as a token, but add select sub-bits for robustness\n    if (t) tokens.push(t.toLowerCase());\n    for (const b of bits) {\n      if (b.length >= 2) tokens.push(b.toLowerCase());\n    }\n  }\n\n  // De-dup\n  return Array.from(new Set(tokens));\n}\n\nfunction fuzzyFind(summary) {\n  const toks = segmentsFromSummary(summary);\n  if (!toks.length) return null;\n\n  // Score each candidate by how many tokens it contains; pick the newest among top score ties\n  let best = null;\n  let bestScore = -1;\n\n  for (const issue of searchIssues) {\n    const s = (issue.fields?.summary ?? issue.summary ?? '').toLowerCase();\n    if (!s) continue;\n\n    let score = 0;\n    for (const tk of toks) {\n      if (s.includes(tk)) score++;\n    }\n\n    if (score > bestScore) {\n      best = issue; bestScore = score;\n    } else if (score === bestScore && best) {\n      best = newer(issue, best);\n    }\n  }\n\n  // Require at least 2 token hits to avoid spurious matches (1 is too weak)\n  if (best && bestScore >= Math.min(2, toks.length)) return best;\n  return null;\n}\n\n// Build output\nlet out = groups.map(g => {\n  const exact = bySummary.get(norm(g.summary));\n  const hit = exact || fuzzyFind(g.summary);\n  const existingKey = hit ? (hit.key || hit.id || null) : null;\n  const exists = !!existingKey;\n  return { json: { ...g, exists, existingKey } };\n});\n\n// Helpful debug when your RRD query returned nothing\nif (!searchIssues.length) {\n  out = out.map(it => ({\n    json: { ...it.json, _debug: \"No items from 'Check RRD'. Verify node name & JQL; enable 'Always Output Data' and set a high limit.\" }\n  }));\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        -976
+      ],
+      "id": "dc91d908-d702-41e1-bce0-35699d5a744e",
+      "name": "Decide_Update/Create"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c57c390e-e8fb-4686-9e4e-98d176077b22",
+              "name": "tool",
+              "value": "kubescape",
+              "type": "string"
+            },
+            {
+              "id": "6cc1719d-d647-4fac-ae09-bc41215db79e",
+              "name": "sourceProject",
+              "value": "DSH",
+              "type": "string"
+            },
+            {
+              "id": "d0514606-6d8c-4fbf-a554-952d9b391772",
+              "name": "createProject",
+              "value": "RRD",
+              "type": "string"
+            },
+            {
+              "id": "d3887493-9066-4632-918f-6919605db249",
+              "name": "statusCategory",
+              "value": "Done",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -592,
+        -1184
+      ],
+      "id": "84fe3a42-981a-4a66-8e85-8e21bb3376d5",
+      "name": "Config",
+      "notes": "zaproxy, trufflehog, securityhub, checkov, prowler, kubescape"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "options": {
+          "jql": "={{ $json.jql }}"
+        }
+      },
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        -144,
+        -1184
+      ],
+      "id": "4c8a232d-70bd-4fa4-9f8e-c88213af2024",
+      "name": "Get DSH Issues",
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "b50v6lNF0s5upqH3",
+          "name": "JiraAPI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// JQL Builder — supports zaproxy, trufflehog, securityhub, checkov, kubescape\nconst cfg = ($node[\"Config\"]?.json) || {};\nconst tool          = String(cfg.tool || \"zaproxy\").toLowerCase();\nconst requireLabel  = (cfg.requireLabel ?? true);\nconst labelOverride = cfg.labelOverride;\nconst rrdProject    = String(cfg.rrdProject || \"RRD\");\nconst sinceDays     = cfg.sinceDays;\nconst statusCat     = cfg.statusCategory;\nconst extraJql      = (cfg.extraJql || \"\").trim();\n\nconst esc = (s) => String(s || \"\").replace(/\\\\/g, \"\\\\\\\\\").replace(/\"/g, '\\\\\"');\n\nconst labelForTool = (t) => {\n  if (labelOverride) return labelOverride;\n  if (t === \"trufflehog\")  return \"Trufflehog\";\n  if (t === \"securityhub\") return \"SecurityHub\";\n  if (t === \"checkov\")     return \"Checkov\";\n  if (t === \"kubescape\")   return \"Kubescape\";\n  return \"Zaproxy\";\n};\n\nfunction appendCommon(parts, t) {\n  if (requireLabel) parts.push(`labels in (\"${esc(labelForTool(t))}\")`);\n  if (sinceDays)    parts.push(`updated >= -${parseInt(sinceDays,10)}d`);\n  if (statusCat)    parts.push(`statusCategory != ${esc(statusCat)}`);\n  if (extraJql)     parts.push(`(${extraJql})`);\n}\n\nfunction jqlForZap(summary) {\n  const m = String(summary || \"\").match(/^\\s*(https?:\\/\\/[^ ]+)\\s*-\\s*(.+)\\s*$/i);\n  const endpoint = m ? m[1] : String(summary || \"\");\n  const owner    = m ? m[2] : \"\";\n  const host     = endpoint.replace(/^https?:\\/\\//i, \"\").replace(/\\/.*$/, \"\");\n\n  const parts = [\n    `project = ${esc(rrdProject)}`,\n    `(summary ~ \"${esc(`${host}${owner ? ` - ${owner}` : \"\"}`)}\" OR (summary ~ \"${esc(host)}\"${owner ? ` AND summary ~ \"${esc(owner)}\"` : \"\"}))`,\n  ];\n  appendCommon(parts, \"zaproxy\");\n  return { jql: parts.join(\" AND \") + \" ORDER BY created DESC\", parts, labelUsed: labelForTool(\"zaproxy\") };\n}\n\nfunction jqlForTrufflehog(summary) {\n  const m = String(summary || \"\").match(/^\\s*(.+?)\\s*-\\s*(.+)\\s*$/);\n  const owner = m ? m[1] : String(summary || \"\");\n  const file  = m ? m[2] : \"\";\n\n  const parts = [\n    `project = ${esc(rrdProject)}`,\n    `(summary ~ \"${esc(`${owner} - ${file}`)}\" OR (summary ~ \"${esc(owner)}\"${file ? ` AND summary ~ \"${esc(file)}\"` : \"\"}))`,\n  ];\n  appendCommon(parts, \"trufflehog\");\n  return { jql: parts.join(\" AND \") + \" ORDER BY created DESC\", parts, labelUsed: labelForTool(\"trufflehog\") };\n}\n\nfunction jqlForSecurityHub(summary) {\n  const raw = String(summary || \"\");\n  const acct    = (raw.match(/Account-ID:\\s*(\\d{6,})/i)   || [])[1] || \"\";\n  const region  = (raw.match(/Region:\\s*([\\w-]+)/i)       || [])[1] || \"\";\n  const finding = (raw.match(/Finding:\\s*([^\\s]+)\\s*$/i)  || [])[1] || \"\";\n\n  const tokens = [];\n  if (acct)    tokens.push(`summary ~ \"${esc(acct)}\"`);\n  if (finding) tokens.push(`summary ~ \"${esc(finding)}\"`);\n  if (region)  tokens.push(`summary ~ \"${esc(region)}\"`);\n  if (!tokens.length) tokens.push(`summary ~ \"${esc(raw)}\"`);\n\n  const parts = [\n    `project = ${esc(rrdProject)}`,\n    `(${tokens.join(\" AND \")})`,\n  ];\n  appendCommon(parts, \"securityhub\");\n  return { jql: parts.join(\" AND \") + \" ORDER BY created DESC\", parts, labelUsed: labelForTool(\"securityhub\") };\n}\n\n// Checkov → \"<Repo Owner> - <Check Name>\"\nfunction jqlForCheckov(summary) {\n  const m = String(summary || \"\").match(/^\\s*(.+?)\\s*-\\s*(.+)\\s*$/);\n  const owner = m ? m[1] : String(summary || \"\");\n  const check = m ? m[2] : \"\";\n\n  const parts = [\n    `project = ${esc(rrdProject)}`,\n    `(summary ~ \"${esc(`${owner} - ${check}`)}\" OR (summary ~ \"${esc(owner)}\"${check ? ` AND summary ~ \"${esc(check)}\"` : \"\"}))`,\n  ];\n  appendCommon(parts, \"checkov\");\n  return { jql: parts.join(\" AND \") + \" ORDER BY created DESC\", parts, labelUsed: labelForTool(\"checkov\") };\n}\n\n// Kubescape → we target the repo link + (optionally) a stable token like Control ID\n// Your grouped summary will be \"Kubescape Alert - <repo_link> - <something>\"\n// so we at least require the repo_link; the “something” can change over time.\nfunction jqlForKubescape(summary) {\n  const raw = String(summary || \"\");\n  // Try to extract the repo link if in the standard \"Kubescape Alert - repo - ...\" format\n  let repo = \"\";\n  const m = raw.match(/^\\s*Kubescape\\s*Alert\\s*-\\s*(.+?)\\s*-\\s*(.+)\\s*$/i);\n  if (m) {\n    repo = m[1].trim();\n  } else {\n    // Fallback: just use the big summary text (safe-quoted)\n    repo = raw;\n  }\n\n  const parts = [\n    `project = ${esc(rrdProject)}`,\n    `(summary ~ \"${esc(repo)}\")`,\n  ];\n  appendCommon(parts, \"kubescape\");\n  return { jql: parts.join(\" AND \") + \" ORDER BY created DESC\", parts, labelUsed: labelForTool(\"kubescape\") };\n}\n\nconst out = items.map(it => {\n  const summary = it.json?.summary ?? it.json?.fields?.summary ?? \"\";\n  let built;\n  if (tool === \"trufflehog\")       built = jqlForTrufflehog(summary);\n  else if (tool === \"securityhub\") built = jqlForSecurityHub(summary);\n  else if (tool === \"checkov\")     built = jqlForCheckov(summary);\n  else if (tool === \"kubescape\")   built = jqlForKubescape(summary);\n  else                             built = jqlForZap(summary);\n\n  return {\n    json: {\n      ...it.json,\n      jql: built.jql,\n      jqlParts: built.parts,\n      labelUsed: built.labelUsed,\n      _builder: { tool, requireLabel, rrdProject, sinceDays, statusCat, extraJql, labelOverride }\n    }\n  };\n});\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        528,
+        -896
+      ],
+      "id": "660ba43d-96a8-4271-bdb8-8044df90d9b2",
+      "name": "Build RRD JQL"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build JQL from Config (expects this node to receive one item with your config)\n// Supported tools: \"zaproxy\", \"trufflehog\", \"securityhub\"\n\nconst cfg = $json;\nconst esc = (s='') => String(s).replace(/\\\\/g, '\\\\\\\\').replace(/\"/g, '\\\\\"');\n\nconst defaults = {\n  zaproxy:    ({ sourceProject, label }) => `project = ${esc(sourceProject)} AND labels = \"${esc(label || 'Zaproxy')}\"`,\n  trufflehog: ({ sourceProject, label }) => `project = ${esc(sourceProject)} AND labels = \"${esc(label || 'Trufflehog')}\"`,\n  securityhub:({ sourceProject, label }) => `project = ${esc(sourceProject)} AND labels = \"${esc(label || 'SEC_HUB')}\"`,\n  checkov:({ sourceProject, label }) => `project = ${esc(sourceProject)} AND labels = \"${esc(label || 'Checkov')}\"`,\n  prowler:({ sourceProject, label }) => `project = ${esc(sourceProject)} AND labels = \"${esc(label || 'Prowler')}\"`,\n  kubescape:({ sourceProject, label }) => `project = ${esc(sourceProject)} AND labels = \"${esc(label || 'Kubescape')}\"`,\n};\n\nlet jql = (cfg.jqlOverride || '').trim();\nif (!jql) {\n  const maker = defaults[cfg.tool] || defaults.zaproxy;\n  jql = maker(cfg);\n}\nif (cfg.sinceDays)      jql += ` AND updated >= -${parseInt(cfg.sinceDays, 10)}d`;\nif (cfg.statusCategory) jql += ` AND statusCategory != ${esc(cfg.statusCategory)}`;\nif (cfg.extraJql)       jql += ` AND (${cfg.extraJql})`;\n\nreturn [{ json: { ...cfg, jql } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -368,
+        -1184
+      ],
+      "id": "1a3fee69-8b00-48b3-9d99-566d5eac4289",
+      "name": "Build DSH JQL"
+    },
+    {
+      "parameters": {
+        "mode": "chooseBranch",
+        "useDataOfInput": 2
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        976,
+        -976
+      ],
+      "id": "1c1817d5-1d8b-4c28-80a2-183eb8d0b7b9",
+      "name": "Merge RRD Data"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "issueKey": "={{$json.existingKey}}",
+        "additionalFields": {
+          "fields": "description,labels,customfield_10063,customfield_10065,customfield_10066,customfield_10067"
+        }
+      },
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1872,
+        -1072
+      ],
+      "id": "84be73f3-8632-4a7a-abac-d54c5bade19b",
+      "name": "Get RRD Issue",
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "b50v6lNF0s5upqH3",
+          "name": "JiraAPI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "issueKey": "={{$json.issueKey}}",
+        "updateFields": {
+          "customFieldsUi": {
+            "customFieldsValues": [
+              {
+                "fieldId": {
+                  "__rl": true,
+                  "value": "customfield_10066",
+                  "mode": "list",
+                  "cachedResultName": "Description Of Risk"
+                },
+                "fieldValue": "={{ $json.fields.customfield_10066 }}"
+              },
+              {
+                "fieldId": {
+                  "__rl": true,
+                  "value": "customfield_10067",
+                  "mode": "list",
+                  "cachedResultName": "Mitigating Controls"
+                },
+                "fieldValue": "={{ $json.fields.customfield_10067 }}"
+              },
+              {
+                "fieldId": {
+                  "__rl": true,
+                  "value": "customfield_10065",
+                  "mode": "list",
+                  "cachedResultName": "Asset(s) Affected"
+                },
+                "fieldValue": "={{ $json.fields.customfield_10065 }}"
+              },
+              {
+                "fieldId": {
+                  "__rl": true,
+                  "value": "customfield_10064",
+                  "mode": "list",
+                  "cachedResultName": "Threat and Vulnerability Information"
+                },
+                "fieldValue": "={{ $json.fields.customfield_10064 || $json.fields.threat_vuln }}"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        2320,
+        -1136
+      ],
+      "id": "3bea6cc2-480d-4608-a186-73cf35a108bd",
+      "name": "Update RRD Issue",
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "b50v6lNF0s5upqH3",
+          "name": "JiraAPI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2544,
+        -1072
+      ],
+      "id": "b0df88cd-b234-48b4-93a6-d4028e3a3a06",
+      "name": "Merge Update Data"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2320,
+        -1328
+      ],
+      "id": "ecee7fd7-eefb-432d-b641-b359dd9474d9",
+      "name": "Merge Create Data"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Test workflow’": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract&Group": {
+      "main": [
+        [
+          {
+            "node": "Tag Index",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tag Index": {
+      "main": [
+        [
+          {
+            "node": "Merge Create Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge RRD Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build RRD JQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Grouped Issue (RRD)": {
+      "main": [
+        [
+          {
+            "node": "Tag Created Index",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tag Created Index": {
+      "main": [
+        [
+          {
+            "node": "Merge Create Data",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "rrdKey(Create)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check RRD": {
+      "main": [
+        [
+          {
+            "node": "Merge RRD Data",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "IF (Exists?)": {
+      "main": [
+        [
+          {
+            "node": "Get RRD Issue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Create Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Update Payload": {
+      "main": [
+        [
+          {
+            "node": "Update RRD Issue",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Update Data",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Prepare Create Fields": {
+      "main": [
+        [
+          {
+            "node": "Create Grouped Issue (RRD)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "rrdKey(Update)": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "rrdKey(Create)": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge2": {
+      "main": [
+        [
+          {
+            "node": "Link Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide_Update/Create": {
+      "main": [
+        [
+          {
+            "node": "IF (Exists?)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Build DSH JQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get DSH Issues": {
+      "main": [
+        [
+          {
+            "node": "Extract&Group",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build RRD JQL": {
+      "main": [
+        [
+          {
+            "node": "Check RRD",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build DSH JQL": {
+      "main": [
+        [
+          {
+            "node": "Get DSH Issues",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge RRD Data": {
+      "main": [
+        [
+          {
+            "node": "Decide_Update/Create",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get RRD Issue": {
+      "main": [
+        [
+          {
+            "node": "Create Update Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update RRD Issue": {
+      "main": [
+        [
+          {
+            "node": "Merge Update Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Update Data": {
+      "main": [
+        [
+          {
+            "node": "rrdKey(Update)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Create Data": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "cc4eaf47-9a0f-4072-9098-a61ee203c5ca",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "c610e73759c34c4ae3c24d94e9cb6499da8f9b1d1bee6ffd17a55a48495ba547"
+  },
+  "id": "aKWKqDq2BU0zEili",
+  "tags": []
+}

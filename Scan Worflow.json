@@ -1,0 +1,496 @@
+{
+  "name": "Scan Worflow",
+  "nodes": [
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://kubernetes.default.svc/apis/batch/v1/namespaces/{{$json.namespace || 'n8n'}}/jobs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/yaml"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.K8S_BEARER_TOKEN}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/yaml",
+        "body": "={{ $json.yaml }}",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2688,
+        16
+      ],
+      "id": "7019dd70-470d-4c2a-bdc4-204a9ccda571",
+      "name": "Create Job"
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://kubernetes.default.svc/apis/batch/v1/namespaces/{{$json.namespace}}/jobs/{{$json.jobName}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.K8S_BEARER_TOKEN}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"kind\": \"DeleteOptions\",\n  \"apiVersion\": \"v1\",\n  \"gracePeriodSeconds\": 0,\n  \"propagationPolicy\": \"Foreground\"\n}\n",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1792,
+        88
+      ],
+      "id": "42bb6547-6757-4e14-ab1d-b8e1d7cf843b",
+      "name": "Delete Job",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parses top-level metadata from every incoming item.\n// Expects each item.json to contain the YAML string at .data (or .body for Full Response).\n\nconst inItems = $input.all();\n\nreturn inItems.map((item, idx) => {\n  const yamlStr =\n    typeof item.json?.data === 'string' ? item.json.data :\n    typeof item.json?.body === 'string' ? item.json.body :\n    (typeof item.json === 'string' ? item.json : null);\n\n  if (typeof yamlStr !== 'string') {\n    throw new Error(`Item ${idx}: expected YAML string at .data (or .body), got ${typeof yamlStr}`);\n  }\n\n  // Only the TOP-LEVEL metadata block\n  const metaBlockMatch = yamlStr.match(/(^|\\n)metadata:\\s*\\n([\\s\\S]*?)(?=\\n\\S|\\n$)/m);\n  if (!metaBlockMatch) throw new Error(`Item ${idx}: top-level 'metadata:' block not found`);\n  const meta = metaBlockMatch[2];\n\n  const nameMatch = meta.match(/^\\s*name:\\s*([A-Za-z0-9.-]+)/m);\n  const genMatch  = meta.match(/^\\s*generateName:\\s*([A-Za-z0-9.-]+)-?/m);\n  const nsMatch   = meta.match(/^\\s*namespace:\\s*([A-Za-z0-9-]+)/m);\n\n  const jobName      = nameMatch ? nameMatch[1] : null;\n  const generateName = genMatch  ? genMatch[1] : null;\n  const namespace    = nsMatch   ? nsMatch[1] : (item.json.namespace || 'n8n');\n\n  if (!jobName && !generateName) {\n    throw new Error(`Item ${idx}: neither metadata.name nor metadata.generateName found`);\n  }\n\n  // Try to infer tool if not set upstream\n  const tool = item.json.tool || (jobName ? jobName.split('-')[0] : undefined);\n\n  return {\n    json: {\n      tool,\n      jobName,\n      generateName,   // present if YAML uses generateName\n      namespace,\n      yaml: yamlStr\n    }\n  };\n// Parses top-level metadata from EVERY incoming item.\n// Expects each item.json to contain the YAML string at .data (or .body for Full Response).\n\nconst inItems = $input.all();\n\nreturn inItems.map((item, idx) => {\n  const yamlStr =\n    typeof item.json?.data === 'string' ? item.json.data :\n    typeof item.json?.body === 'string' ? item.json.body :\n    (typeof item.json === 'string' ? item.json : null);\n\n  if (typeof yamlStr !== 'string') {\n    throw new Error(`Item ${idx}: expected YAML string at .data (or .body), got ${typeof yamlStr}`);\n  }\n\n  const metaBlockMatch = yamlStr.match(/(^|\\n)metadata:\\s*\\n([\\s\\S]*?)(?=\\n\\S|\\n$)/m);\n  if (!metaBlockMatch) throw new Error(`Item ${idx}: top-level 'metadata:' block not found`);\n  const meta = metaBlockMatch[2];\n\n  const nameMatch = meta.match(/^\\s*name:\\s*([A-Za-z0-9.-]+)/m);\n  const genMatch  = meta.match(/^\\s*generateName:\\s*([A-Za-z0-9.-]+)-?/m);\n  const nsMatch   = meta.match(/^\\s*namespace:\\s*([A-Za-z0-9-]+)/m);\n\n  const jobName      = nameMatch ? nameMatch[1] : null;\n  const generateName = genMatch  ? genMatch[1] : null;\n  const namespace    = nsMatch   ? nsMatch[1] : (item.json.namespace || 'n8n');\n\n  if (!jobName && !generateName) {\n    throw new Error(`Item ${idx}: neither metadata.name nor metadata.generateName found`);\n  }\n\n  const tool = item.json.tool || (jobName ? jobName.split('-')[0] : undefined);\n\n  return { json: { tool, jobName, generateName, namespace, yaml: yamlStr } };\n});\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        16
+      ],
+      "id": "bae15d5d-12c5-4b71-b2d1-9fba09cb95b3",
+      "name": "Parse Yaml"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/deploy-scan-job",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        16
+      ],
+      "id": "374a58a1-d7f4-43d1-a327-c37eb3d67406",
+      "name": "Webhook",
+      "webhookId": "31d7cdb2-7d6b-47a4-9c32-8c2c8ce38fa2"
+    },
+    {
+      "parameters": {
+        "jsCode": "// --- INPUTS ---\n// Webhook shape: $json.body contains payload; else use $json\nconst src = $json?.body && typeof $json.body === 'object' ? $json.body : $json;\n\n// Defaults\nconst DEFAULTS = {\n  owner:     \"cray9741\",\n  repo:      \"ScanJobs\",\n  branch:    \"main\",\n  namespace: \"n8n\",\n};\n\n// Pull fields (fallback to defaults)\nlet owner     = src.owner     ?? DEFAULTS.owner;\nlet repo      = src.repo      ?? DEFAULTS.repo;\nlet branch    = src.branch    ?? DEFAULTS.branch;\nlet namespace = src.namespace ?? DEFAULTS.namespace;\n\n// Accept both `tool` and/or `tools` (string or array). Coerce to array.\nfunction coerceTools(v1, v2){\n  let parts = [];\n  const push = (v) => {\n    if (Array.isArray(v)) parts.push(...v);\n    else if (typeof v === 'string') {\n      // split on comma or whitespace, trim, drop empties\n      parts.push(...v.split(/[,\\s]+/).map(s => s.trim()).filter(Boolean));\n    }\n  };\n  push(v1); push(v2);\n  // unique + lowercase\n  parts = [...new Set(parts.map(t => String(t).toLowerCase()))];\n  // treat \"all\" specially\n  const wantsAll = parts.length === 0 || parts.includes('all');\n  return { wantsAll, tools: wantsAll ? [] : parts };\n}\nconst { wantsAll, tools } = coerceTools(src.tool, src.tools);\n\n// Normalize owner/repo if repo is \"owner/repo\" or a full URL\nfunction normalizeOwnerRepo(ownerVal, repoVal){\n  let o = ownerVal || \"\";\n  let r = (repoVal || \"\").trim();\n  if (/^https?:\\/\\/(www\\.)?github\\.com\\//i.test(r)) {\n    const path = r.replace(/^https?:\\/\\/(www\\.)?github\\.com\\//i, \"\").replace(/\\.git$/i, \"\");\n    const parts = path.split(\"/\").filter(Boolean);\n    if (parts.length >= 2) { o = parts[0]; r = parts[1]; }\n  } else if (!o && r.includes(\"/\")) {\n    const parts = r.split(\"/\").filter(Boolean);\n    if (parts.length >= 2) { o = parts[0]; r = parts[1]; }\n  }\n  if (!o || !r) throw new Error(`Missing owner/repo after normalization (owner='${o}', repo='${r}').`);\n  return { owner: o, repo: r };\n}\n({ owner, repo } = normalizeOwnerRepo(owner, repo));\n\n// Build list URL for \"deploy all\" mode\nconst scansListUrl = `https://api.github.com/repos/${owner}/${repo}/contents/Scans?ref=${encodeURIComponent(branch)}`;\n\nreturn [{\n  json: {\n    owner, repo, branch, namespace,\n    deployAll: wantsAll,        // true → list Scans/ and fan out\n    tools,                      // explicit list (if any)\n    scansListUrl\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        16
+      ],
+      "id": "a42d7680-c7b4-4aa5-bb34-3e70e849edc2",
+      "name": "Config",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        672,
+        16
+      ],
+      "id": "5a09d102-b5cc-445d-a98f-2f4cd657516e",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a2174b4c-e8bb-4aa9-a374-2d492b6a608b",
+              "leftValue": "={{$json.generateName}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1568,
+        16
+      ],
+      "id": "b040d57e-d116-43a9-9b02-11bca7d8821b",
+      "name": "IF — Has generateName?"
+    },
+    {
+      "parameters": {
+        "amount": 2.5
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2016,
+        88
+      ],
+      "id": "108df637-228d-4044-9b2e-950fd9468d30",
+      "name": "Wait",
+      "webhookId": "0fc0cffa-fd08-4a7e-837a-7aa652cca137"
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/apis/batch/v1/namespaces/{{$json.namespace}}/jobs/{{$json.jobName}}\n",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.K8S_BEARER_TOKEN}}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {}
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2240,
+        16
+      ],
+      "id": "5a54c283-2849-42c3-85db-1d1bb14eea6e",
+      "name": "Get Job",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.scansListUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.raw"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        448,
+        88
+      ],
+      "id": "b759b89c-2635-4c88-b37b-0d507b98d627",
+      "name": "List Scans",
+      "credentials": {
+        "githubApi": {
+          "id": "fg1umOTD6ySuQlzX",
+          "name": "GitHub account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.fetchUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.raw"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        16
+      ],
+      "id": "c89a6ac7-e834-48d9-bbdc-638b650776d8",
+      "name": "Get Scans",
+      "credentials": {
+        "githubApi": {
+          "id": "fg1umOTD6ySuQlzX",
+          "name": "GitHub account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// This node receives MANY merged items (config + one folder each)\nconst items = $input.all();\n\nconst out = [];\nfor (const it of items) {\n  const cfg = {\n    owner: it.json.owner, repo: it.json.repo, branch: it.json.branch,\n    namespace: it.json.namespace, deployAll: it.json.deployAll,\n    tools: Array.isArray(it.json.tools) ? it.json.tools : []\n  };\n  const folder = String(it.json.name || \"\").toLowerCase(); // folder name under Scans/\n\n  const include = cfg.deployAll || cfg.tools.includes(folder);\n  if (!include) continue;\n\n  out.push({\n    json: {\n      owner: cfg.owner, repo: cfg.repo, branch: cfg.branch,\n      namespace: cfg.namespace, tool: folder,\n      // convenience URL for next step\n      fetchUrl: `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/Scans/${folder}/job.yaml?ref=${encodeURIComponent(cfg.branch)}`\n    }\n  });\n}\n\nif (!out.length) throw new Error(\"No tools selected. Provide tool(s) or ensure Scans/ has subfolders.\");\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        16
+      ],
+      "id": "3851afc2-672b-4074-910f-b8b5a27994fc",
+      "name": "Parse List"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "87d1759b-0b44-4fe4-8de0-e6d7924c6469",
+              "leftValue": null,
+              "rightValue": 404,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2464,
+        88
+      ],
+      "id": "c8d228d5-b5b4-4754-bdd0-dd19cbb35566",
+      "name": "IF — Gone yet?"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Create Job": {
+      "main": [
+        []
+      ]
+    },
+    "Delete Job": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Yaml": {
+      "main": [
+        [
+          {
+            "node": "IF — Has generateName?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "List Scans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Parse List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Has generateName?": {
+      "main": [
+        [
+          {
+            "node": "Create Job",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Delete Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Get Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Scans": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Get Scans": {
+      "main": [
+        [
+          {
+            "node": "Parse Yaml",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse List": {
+      "main": [
+        [
+          {
+            "node": "Get Scans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Job": {
+      "main": [
+        [
+          {
+            "node": "IF — Gone yet?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Gone yet?": {
+      "main": [
+        [
+          {
+            "node": "Create Job",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "d472cd5d-256a-48a7-8b48-c44de7327618",
+  "meta": {
+    "instanceId": "4e757bc6f0d04619b42bb59cea30c0a3b0b837b054737f030d9b19fd0d3a6fad"
+  },
+  "id": "UOI54iy2oQBS9NkQ",
+  "tags": []
+}

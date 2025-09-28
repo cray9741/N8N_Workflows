@@ -1,0 +1,662 @@
+{
+  "name": "Import Workflow(Elastic)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "scan-import/",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        96,
+        320
+      ],
+      "id": "0bf1ca03-ed40-4a4b-bd8d-1eec25f9b17e",
+      "name": "Scan Import",
+      "webhookId": "9525894c-a643-49e2-8178-0820285c0789",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Hard defaults you can change\nconst defaults = {\n  bucket: \"tools-bucket-cloudranger-30293812\",\n  prefix: \"\",  // optional path (no leading '/')\n  ignoreFolders: [\"processed\",\"backups\"],\n  mainIndex: \"security-findings\",\n  eventsIndex: \"security-findings-events\",\n  processedPrefix: \"processed/\",             // where to move inside the same bucket\n  processedBucket: \"\",                       // leave blank to keep same bucket\n\n};\n\n// Webhook sends either {body:{...}} or raw JSON\nconst raw = ($json.body && typeof $json.body === 'object') ? $json.body : $json;\n\n// normalize ignoreFolders (array or comma-separated string)\nlet ignore = raw.ignoreFolders;\nif (typeof ignore === 'string') {\n  ignore = ignore.split(',').map(s => s.trim()).filter(Boolean);\n}\nif (!Array.isArray(ignore)) ignore = undefined;\n\n// normalize prefix: strip slashes, then make folderKey (trailing slash if non-empty)\nconst p = (raw.prefix ?? defaults.prefix ?? '').toString().replace(/^\\/+|\\/+$/g,'');\nconst folderKey = p ? (p.endsWith('/') ? p : p + '/') : '';\n\n// final config\nconst cfg = {\n  ...defaults,\n  ...raw,\n  ...(ignore ? { ignoreFolders: ignore } : {}),\n  prefix: p,          // clean, no slashes\n  folderKey           // S3 \"Folder Key\" friendly\n};\n\nreturn [{ json: cfg }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        320
+      ],
+      "id": "ff6797af-56b7-4ebf-a7dd-ba95b2880572",
+      "name": "Apply Defaults"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "bucketName": "={{ $json.bucket }}",
+        "returnAll": true,
+        "options": {
+          "folderKey": "={{ $json.folderKey }}"
+        }
+      },
+      "type": "n8n-nodes-base.awsS3",
+      "typeVersion": 2,
+      "position": [
+        544,
+        320
+      ],
+      "id": "fd13dd1d-0d8b-40f6-b1da-9be69f1ffc58",
+      "name": "List Files",
+      "credentials": {
+        "aws": {
+          "id": "M1noIGNa4Ad2wJPJ",
+          "name": "AWS account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $items('Apply Defaults')?.[0]?.json || {};\nconst ignore = (cfg.ignoreFolders || []).map(s => String(s).replace(/\\/+$/,''));\nconst out = [];\n\nfor (const it of $items('List Files')) {\n  const key = it.json.Key || it.json.key || '';\n  if (!key.toLowerCase().endsWith('.json')) continue;\n\n  // skip ignored folders (prefix match)\n  if (ignore.some(pre => pre && (key === pre || key.startsWith(pre + '/')))) continue;\n\n  // tag tool by path/name\n  let tool = 'unknown';\n  if (/zaproxy|zap/i.test(key)) tool = 'zaproxy';\n  else if (/checkov/i.test(key)) tool = 'checkov';\n  else if (/trufflehog/i.test(key)) tool = 'trufflehog';\n\n  out.push({\n    json: {\n      bucket: cfg.bucket,\n      key,\n      tool,\n      mainIndex: cfg.mainIndex,\n      eventsIndex: cfg.eventsIndex\n    }\n  });\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        768,
+        320
+      ],
+      "id": "4edc420a-28f4-471a-9385-ce77ab21b7fc",
+      "name": "Filter & Tag Keys"
+    },
+    {
+      "parameters": {
+        "options": {
+          "reset": false
+        }
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        992,
+        320
+      ],
+      "id": "bac33ece-6bfd-4269-9f51-026b648fadab",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "jsCode": "// -------- helpers --------\nfunction fnv1a64Hex(str){\n  let h=BigInt('0xcbf29ce484222325'), p=BigInt('0x100000001b3');\n  for (let i=0;i<str.length;i++){ h^=BigInt(str.charCodeAt(i)); h=(h*p)&BigInt('0xFFFFFFFFFFFFFFFF'); }\n  return h.toString(16).padStart(16,'0');\n}\nconst fingerprintOf = (tool, signature) =>\n  fnv1a64Hex(JSON.stringify({ tool, signature }));\n\nconst ZAP_RISK = { \"0\":\"Informational\", \"1\":\"Low\", \"2\":\"Medium\", \"3\":\"High\" };\nconst ZAP_CONF = { \"1\":7, \"2\":4, \"3\":2, \"4\":1 }; // higher = more confident\n\nconst normParam = (p) => (p === '' || p == null) ? null : String(p).trim().toLowerCase();\nconst normMethod = (m) => {\n  const v = (m || '').toString().trim().toUpperCase();\n  return v || null;\n};\n\n// Parse a single ZAP scan object\nfunction parseZap(scan){\n  const sites  = Array.isArray(scan?.site) ? scan.site : [];\n  const alerts = sites.flatMap(s => s?.alerts || []);\n  const rows = [];\n\n  for (const a of alerts){\n    const title    = (a.alert || a.name || 'ZAP Finding').trim();\n    const pluginid = String(a.pluginid || '').trim();\n    const desc     = a.desc || a.description || '';\n    const severity = ZAP_RISK[String(a.riskcode ?? '')] || ((a.riskdesc||'').split(' ')[0] || 'Informational');\n    const conf     = ZAP_CONF[String(a.confidence ?? '')] ?? null;\n    const cwe      = a.cweid || a.cwe || null;\n    const siteOwner= a['Site Owner'] ?? a.site_owner ?? null;\n\n    const inst = Array.isArray(a.instances) && a.instances.length\n      ? a.instances\n      : [{ uri: null, method: null, param: null }];\n\n    for (const it of inst){\n      const url    = it.uri || it.url || null;\n      const method = normMethod(it.method);\n      const param  = normParam(it.param);\n      // NOTE: site_owner is NOT in the signature/fingerprint\n      const signature = { pluginid, title, url, method, param };\n\n      rows.push({\n        tool: 'zaproxy',\n        title, pluginid, severity,\n        description: desc,\n        scanner_confidence: conf,\n        cwe,\n        site_owner: siteOwner,\n        url, method, param,\n        signature\n      });\n    }\n  }\n  return rows;\n}\n\n// -------- main --------\nconst now = new Date().toISOString();\nconst inputItems = $input.all();\nconst out = [];\n\nfor (const item of inputItems) {\n  const j = item.json || {};\n\n  // These come from \"Extract from file\" (your sample shows them at root)\n  const scan        = j.scan ?? j.data ?? j.report ?? j.content ?? j.payload ?? {};\n  const tool        = j.tool        || 'zaproxy';\n  const mainIndex   = j.mainIndex   || 'security-findings';\n  const eventsIndex = j.eventsIndex || 'security-findings-events';\n\n  // S3 for THIS item only\n  const s3 = (j.s3 && j.s3.bucket && j.s3.key)\n    ? { bucket: j.s3.bucket, key: j.s3.key }\n    : (j.bucket && j.key)    // your extractor puts these at root\n      ? { bucket: j.bucket, key: j.key }\n      : null;\n\n  // De-dupe only within this report\n  const seen = new Set();\n\n  const findings = parseZap(scan);\n  for (const f of findings){\n    const fingerprint = fingerprintOf(tool, f.signature);\n    if (seen.has(fingerprint)) continue;\n    seen.add(fingerprint);\n\n    const mainDoc = {\n      '@timestamp': now,\n      tool,\n      title: f.title,\n      severity: f.severity,\n      description: f.description || '',\n      scanner_confidence: f.scanner_confidence ?? null,\n      site_owner: f.site_owner ?? null,\n      cwe: f.cwe || null,\n      pluginid: f.pluginid || null,\n      url: f.url ?? null,\n      method: f.method ?? null,\n      param: f.param ?? null,\n      dedupe: { fingerprint, signature: f.signature }\n    };\n\n    const eventDoc = {\n      '@timestamp': now,\n      type: 'observation',\n      fingerprint,\n      tool,\n      title: f.title,\n      severity: f.severity\n    };\n\n    if (s3){ mainDoc.s3 = s3; eventDoc.s3 = s3; }\n\n    out.push({\n      json: {\n        now,\n        fingerprint,\n        mainIndex,\n        eventsIndex,\n        mainDoc,\n        eventDoc\n      }\n    });\n  }\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1664,
+        320
+      ],
+      "id": "b164094f-bdb1-4a51-9db3-b0138654b26f",
+      "name": "Parse & Normalize Findings"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Group and collapse\nconst groups = new Map();\nfor (const it of $input.all()) {\n  const fp = it.json.fingerprint;\n  const md = it.json.mainDoc || {};\n  const ed = it.json.eventDoc || {};\n  const arr = groups.get(fp) || [];\n  arr.push({ md, ed });\n  groups.set(fp, arr);\n}\n\nconst uniq = arr => Array.from(new Set((arr||[]).filter(Boolean)));\nfunction uniqSources(list){\n  const seen = new Set(), out = [];\n  for (const s of list || []) {\n    if (!s || !s.bucket || !s.key) continue;\n    const id = `${s.bucket}|${s.key}`;\n    if (seen.has(id)) continue;\n    seen.add(id);\n    out.push({ bucket: s.bucket, key: s.key });\n  }\n  return out;\n}\n\nconst out = [];\nfor (const [fp, arr] of groups) {\n  const first = arr[0].md;\n  const occurrences_delta = arr.length;\n  const endpoints = uniq(arr.map(x => x.md.url));\n  const sources = uniqSources(arr.map(x => x.md.s3));\n\n  const mergedMain = { ...first, url: null, method: null, param: null };\n  if (endpoints.length) mergedMain.endpoints = endpoints;\n\n  const aggEvent = {\n    '@timestamp': first['@timestamp'],\n    type: 'observation',\n    fingerprint: fp,\n    tool: first.tool,\n    title: first.title,\n    severity: first.severity,\n    count: occurrences_delta,\n    s3: first.s3\n  };\n\n  out.push({\n    json: {\n      fingerprint: fp,\n      now: first['@timestamp'],\n      mainIndex: $json.mainIndex || 'security-findings',\n      eventsIndex: $json.eventsIndex || 'security-findings-events',\n      occurrences_delta,\n      mainDoc: mergedMain,\n      eventDoc: aggEvent,\n      // 👇 union of all source objects we processed for this fingerprint\n      sources\n    }\n  });\n}\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1888,
+        320
+      ],
+      "id": "15775772-4b1b-41c8-9432-494c8bc5afa4",
+      "name": "Collapse by Fingerprint"
+    },
+    {
+      "parameters": {
+        "indexId": "={{ $json.mainIndex }}",
+        "documentId": "={{ $json.fingerprint }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.elasticsearch",
+      "typeVersion": 1,
+      "position": [
+        2112,
+        320
+      ],
+      "id": "a9a8bd68-97ae-498f-9cb2-c175830f2ec9",
+      "name": "Get Main Doc",
+      "credentials": {
+        "elasticsearchApi": {
+          "id": "4p8ioNt3lIr5120R",
+          "name": "Elasticsearch account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function union(a, b){ const A=Array.isArray(a)?a:[], B=Array.isArray(b)?b:[]; const s=new Set(), out=[]; for (const x of [...A,...B]) if (x!=null && !s.has(x)) { s.add(x); out.push(x); } return out; }\n\nconst prev = $items('Collapse by Fingerprint');\nconst got  = $input.all();\n\nconst out = [];\nfor (let i = 0; i < got.length; i++) {\n  const esItem   = got[i].json || {};\n  const baseItem = (prev[i] && prev[i].json) ? prev[i].json : {};\n\n  const existing = esItem.Document || esItem._source || null;\n  const incoming = baseItem.mainDoc || {};\n  const now      = baseItem.now;\n  const delta    = baseItem.occurrences_delta || 1;\n\n  const merged = existing ? {\n    ...existing,\n    ...incoming,\n    occurrences: (existing.occurrences || 0) + delta,\n    last_seen: now,\n    endpoints: union(existing.endpoints, incoming.endpoints)\n  } : {\n    ...incoming,\n    occurrences: delta,\n    last_seen: now\n  };\n\n  out.push({\n    json: {\n      exists: !!existing,\n      index: baseItem.mainIndex,\n      id: baseItem.fingerprint,\n      doc: merged,\n      eventsIndex: baseItem.eventsIndex,\n      eventDoc: baseItem.eventDoc,\n      // 👇 carry forward all files to move\n      sources: baseItem.sources,\n      // optional: processed config from defaults if you added them earlier\n      processedPrefix: baseItem.processedPrefix,\n      processedBucket: baseItem.processedBucket\n    }\n  });\n}\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2336,
+        320
+      ],
+      "id": "18445656-7334-4137-b6da-756415167262",
+      "name": "Build Upsert Doc"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "96040819-34e7-4ed2-bda2-77b35436f366",
+              "leftValue": "={{ $json.exists }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2560,
+        368
+      ],
+      "id": "d2c1d0d0-4db8-4190-b189-9a4ffa3b546a",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "indexId": "={{ $json.index }}",
+        "documentId": "={{ $json.id }}",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "Document",
+              "fieldValue": "={{ $json.doc }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.elasticsearch",
+      "typeVersion": 1,
+      "position": [
+        2784,
+        224
+      ],
+      "id": "1324ab10-5d4d-4b9c-8b4c-a50005ab168d",
+      "name": "Update Main Doc",
+      "credentials": {
+        "elasticsearchApi": {
+          "id": "4p8ioNt3lIr5120R",
+          "name": "Elasticsearch account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "indexId": "={{ $json.index }}",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "Document",
+              "fieldValue": "={{ $json.doc }}"
+            }
+          ]
+        },
+        "additionalFields": {
+          "documentId": "={{ $json.id }}"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.elasticsearch",
+      "typeVersion": 1,
+      "position": [
+        2784,
+        416
+      ],
+      "id": "25937671-63fa-4f55-aeeb-7a84191c7e7d",
+      "name": "Create Main Doc",
+      "credentials": {
+        "elasticsearchApi": {
+          "id": "4p8ioNt3lIr5120R",
+          "name": "Elasticsearch account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "indexId": "={{ $json.eventsIndex }}",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "Document",
+              "fieldValue": "={{ $json.eventDoc }}"
+            }
+          ]
+        },
+        "additionalFields": {},
+        "options": {}
+      },
+      "type": "n8n-nodes-base.elasticsearch",
+      "typeVersion": 1,
+      "position": [
+        2784,
+        -208
+      ],
+      "id": "2928b067-d239-4456-8e9f-aa99b8904dfc",
+      "name": "Index Event",
+      "credentials": {
+        "elasticsearchApi": {
+          "id": "4p8ioNt3lIr5120R",
+          "name": "Elasticsearch account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        3008,
+        416
+      ],
+      "id": "0cb11547-4c46-4c75-98f7-0489babd800e",
+      "name": "MergeA",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "advanced": true,
+        "mergeByFields": {
+          "values": [
+            {
+              "field1": "={{ $json.id }}",
+              "field2": "={{ $json._id }}"
+            }
+          ]
+        },
+        "joinMode": "keepEverything",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2560,
+        -112
+      ],
+      "id": "6e6b6a44-df1d-4da1-93ab-233debd30a86",
+      "name": "MergeB"
+    },
+    {
+      "parameters": {
+        "operation": "copy",
+        "sourcePath": "={{ $json.sourcePath }}",
+        "destinationPath": "={{ $json.destPath }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.awsS3",
+      "typeVersion": 2,
+      "position": [
+        3008,
+        -112
+      ],
+      "id": "7fb9e798-43c9-4031-b73c-afdb9871bfff",
+      "name": "Copy a file",
+      "credentials": {
+        "aws": {
+          "id": "M1noIGNa4Ad2wJPJ",
+          "name": "AWS account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function cleanPrefix(p){\n  let x = (p || 'processed/').toString().trim();\n  x = x.replace(/^\\/+/, '');       // no leading slash\n  if (!x.endsWith('/')) x += '/';  // ensure trailing slash\n  return x;\n}\n\nconst prefix = cleanPrefix($json.processedPrefix);\nconst processedBucket = $json.processedBucket || null;\n\n// prefer the union list from Collapse → Build; fallback to single doc.s3\nconst srcs = Array.isArray($json.sources) ? $json.sources\n           : ($json.doc?.s3 ? [ $json.doc.s3 ] : []);\n\nreturn srcs\n  .filter(s => s && s.bucket && s.key)\n  .map(s => {\n    const sourcePath = `/${s.bucket}/${s.key}`;\n    const destBucket = processedBucket || s.bucket;\n    const destKey = `${prefix}${s.key}`;\n    const destPath = `/${destBucket}/${destKey}`;\n    return { json: {\n      source: s,             // { bucket, key }\n      sourcePath,            // \"bucket/key\"\n      dest: { bucket: destBucket, key: destKey },\n      destPath               // \"bucket/prefix/key\"\n    }};\n  });\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2784,
+        -16
+      ],
+      "id": "a8ff85cb-3ed7-4c91-82d7-fbadef518d77",
+      "name": "Create S3 Paths"
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "bucketName": "={{ $json.source.bucket }}",
+        "fileKey": "={{ $json.source.key }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.awsS3",
+      "typeVersion": 2,
+      "position": [
+        3008,
+        80
+      ],
+      "id": "c1cd29db-7601-4420-849c-374f8d2f68f9",
+      "name": "Delete a file",
+      "credentials": {
+        "aws": {
+          "id": "M1noIGNa4Ad2wJPJ",
+          "name": "AWS account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "destinationKey": "scan",
+        "options": {
+          "keepSource": "json"
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        320
+      ],
+      "id": "40b1078a-7b80-4673-b3af-34b675e10591",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "bucketName": "={{ $json.bucket }}",
+        "fileKey": "={{ $json.key }}"
+      },
+      "type": "n8n-nodes-base.awsS3",
+      "typeVersion": 2,
+      "position": [
+        1216,
+        320
+      ],
+      "id": "f8534e48-8f32-442d-b454-6607f8daa96a",
+      "name": "S3 Download",
+      "credentials": {
+        "aws": {
+          "id": "M1noIGNa4Ad2wJPJ",
+          "name": "AWS account"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "Scan Import": [
+      {
+        "json": {
+          "headers": {
+            "host": "n8n-dev.cloudlockops.io",
+            "user-agent": "curl/8.2.1",
+            "content-length": "24",
+            "accept": "*/*",
+            "content-type": "application/json",
+            "x-forwarded-for": "10.42.0.1",
+            "x-forwarded-host": "n8n-dev.cloudlockops.io",
+            "x-forwarded-port": "443",
+            "x-forwarded-proto": "https",
+            "x-forwarded-server": "traefik-c98fdf6fb-l7ssm",
+            "x-real-ip": "10.42.0.1",
+            "accept-encoding": "gzip"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "prefix": "zaproxy/"
+          },
+          "webhookUrl": "https://n8n-dev.cloudlockops.io/webhook-test/scan-import/",
+          "executionMode": "test"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Scan Import": {
+      "main": [
+        [
+          {
+            "node": "Apply Defaults",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Defaults": {
+      "main": [
+        [
+          {
+            "node": "List Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Files": {
+      "main": [
+        [
+          {
+            "node": "Filter & Tag Keys",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "MergeB",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "S3 Download",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter & Tag Keys": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Normalize Findings": {
+      "main": [
+        [
+          {
+            "node": "Collapse by Fingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collapse by Fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Get Main Doc",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Main Doc": {
+      "main": [
+        [
+          {
+            "node": "Build Upsert Doc",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Upsert Doc": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "MergeB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Update Main Doc",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Main Doc",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Main Doc": {
+      "main": [
+        [
+          {
+            "node": "MergeA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Main Doc": {
+      "main": [
+        [
+          {
+            "node": "MergeA",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "MergeA": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MergeB": {
+      "main": [
+        [
+          {
+            "node": "Index Event",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Create S3 Paths",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create S3 Paths": {
+      "main": [
+        [
+          {
+            "node": "Copy a file",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Delete a file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Parse & Normalize Findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "S3 Download": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "136cd540-f7bd-4302-b7c3-9a889ecc1fd1",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "ad1fe9a3c04e4232e7e78d29dfa74a811829cb9d83d22a052a503c60727bee47"
+  },
+  "id": "URXQuJMVFsShnVSU",
+  "tags": []
+}

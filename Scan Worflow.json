@@ -63,7 +63,7 @@
       "typeVersion": 4.2,
       "position": [
         1792,
-        88
+        96
       ],
       "id": "42bb6547-6757-4e14-ab1d-b8e1d7cf843b",
       "name": "Delete Job",
@@ -169,7 +169,7 @@
       "typeVersion": 1.1,
       "position": [
         2016,
-        88
+        96
       ],
       "id": "108df637-228d-4044-9b2e-950fd9468d30",
       "name": "Wait",
@@ -229,7 +229,7 @@
       "typeVersion": 4.2,
       "position": [
         448,
-        88
+        96
       ],
       "id": "b759b89c-2635-4c88-b37b-0d507b98d627",
       "name": "List Scans",
@@ -318,10 +318,24 @@
       "typeVersion": 2.2,
       "position": [
         2464,
-        88
+        96
       ],
       "id": "c8d228d5-b5b4-4754-bdd0-dd19cbb35566",
       "name": "IF — Gone yet?"
+    },
+    {
+      "parameters": {
+        "content": "## Available Tools\n**Checkov**\n**Kubescape**\n**Prowler**\n**Trivy**\n**Trufflhog**\n**Zaproxy** \n\n## Webhook Body\n**{\"tools\":\"<tool>\"}**\n\n[Guide](https://docs.n8n.io/workflows/sticky-notes/)",
+        "height": 256
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        -672
+      ],
+      "id": "479ebd61-66a2-4f5a-9575-e67469132504",
+      "name": "Sticky Note"
     }
   ],
   "pinData": {},
@@ -487,8 +501,9 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "d472cd5d-256a-48a7-8b48-c44de7327618",
+  "versionId": "e60ff0e6-3c1c-4948-a217-0524c01a2eb5",
   "meta": {
+    "templateCredsSetupCompleted": true,
     "instanceId": "4e757bc6f0d04619b42bb59cea30c0a3b0b837b054737f030d9b19fd0d3a6fad"
   },
   "id": "UOI54iy2oQBS9NkQ",

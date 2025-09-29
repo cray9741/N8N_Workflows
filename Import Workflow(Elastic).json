@@ -98,7 +98,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Group and collapse\nconst groups = new Map();\nfor (const it of $input.all()) {\n  const fp = it.json.fingerprint;\n  const md = it.json.mainDoc || {};\n  const ed = it.json.eventDoc || {};\n  const arr = groups.get(fp) || [];\n  arr.push({ md, ed });\n  groups.set(fp, arr);\n}\n\nconst uniq = arr => Array.from(new Set((arr||[]).filter(Boolean)));\nfunction uniqSources(list){\n  const seen = new Set(), out = [];\n  for (const s of list || []) {\n    if (!s || !s.bucket || !s.key) continue;\n    const id = `${s.bucket}|${s.key}`;\n    if (seen.has(id)) continue;\n    seen.add(id);\n    out.push({ bucket: s.bucket, key: s.key });\n  }\n  return out;\n}\n\nconst out = [];\nfor (const [fp, arr] of groups) {\n  const first = arr[0].md;\n  const occurrences_delta = arr.length;\n  const endpoints = uniq(arr.map(x => x.md.url));\n  const sources = uniqSources(arr.map(x => x.md.s3));\n\n  const mergedMain = { ...first, url: null, method: null, param: null };\n  if (endpoints.length) mergedMain.endpoints = endpoints;\n\n  const aggEvent = {\n    '@timestamp': first['@timestamp'],\n    type: 'observation',\n    fingerprint: fp,\n    tool: first.tool,\n    title: first.title,\n    severity: first.severity,\n    count: occurrences_delta,\n    s3: first.s3\n  };\n\n  out.push({\n    json: {\n      fingerprint: fp,\n      now: first['@timestamp'],\n      mainIndex: $json.mainIndex || 'security-findings',\n      eventsIndex: $json.eventsIndex || 'security-findings-events',\n      occurrences_delta,\n      mainDoc: mergedMain,\n      eventDoc: aggEvent,\n      // 👇 union of all source objects we processed for this fingerprint\n      sources\n    }\n  });\n}\nreturn out;\n"
+        "jsCode": "// === Extra-safe Group & Collapse ===\n// - Groups by fingerprint\n// - Carries per-item indices, then picks a group-consistent index\n// - Aggregates endpoints and file paths\n// - Unions all S3 source objects (from both mainDoc/eventDoc)\n// - Never reads indices from $json (avoids cross-item bleed)\n\n// ---------- helpers ----------\nconst uniq = arr => Array.from(new Set((arr || []).filter(v => v != null && v !== '')));\n\nfunction uniqSources(list) {\n  const seen = new Set(), out = [];\n  for (const s of list || []) {\n    if (!s || !s.bucket || !s.key) continue;\n    const id = `${s.bucket}|${s.key}`;\n    if (seen.has(id)) continue;\n    seen.add(id);\n    out.push({ bucket: s.bucket, key: s.key });\n  }\n  return out;\n}\n\n// ---------- collect & group ----------\nconst groups = new Map();\n\nfor (const it of $input.all()) {\n  const j = it.json || {};\n  const fp = j.fingerprint;\n  if (!fp) continue;\n\n  const md = j.mainDoc || {};\n  const ed = j.eventDoc || {};\n  const mainIndex   = j.mainIndex   || 'security-findings';\n  const eventsIndex = j.eventsIndex || 'security-findings-events';\n\n  const arr = groups.get(fp) || [];\n  arr.push({ md, ed, mainIndex, eventsIndex });\n  groups.set(fp, arr);\n}\n\n// ---------- build outputs ----------\nconst out = [];\n\nfor (const [fp, arr] of groups) {\n  if (!arr.length) continue;\n\n  const first = arr[0].md || {};\n  const occurrences_delta = arr.length;\n\n  // endpoints (URLs) & file paths across occurrences\n  const endpoints  = uniq(arr.map(x => x.md && x.md.url));\n  const filePaths  = uniq(arr.map(x => x.md && x.md.file_path));\n\n  // all s3 sources from mainDoc + eventDoc\n  const s3Candidates = [\n    ...arr.map(x => x.md && x.md.s3),\n    ...arr.map(x => x.ed && x.ed.s3),\n  ];\n  const sources = uniqSources(s3Candidates);\n\n  // choose indices safely from the group's own items\n  const mainIdxSet   = new Set(arr.map(x => x.mainIndex).filter(Boolean));\n  const eventsIdxSet = new Set(arr.map(x => x.eventsIndex).filter(Boolean));\n  const groupMainIndex   = mainIdxSet.size   ? [...mainIdxSet][0]   : 'security-findings';\n  const groupEventsIndex = eventsIdxSet.size ? [...eventsIdxSet][0] : 'security-findings-events';\n\n  // optional warnings if mixed indices found within a group\n  const warnings = [];\n  if (mainIdxSet.size > 1)   warnings.push(`Mixed mainIndex for fingerprint ${fp}: ${[...mainIdxSet].join(', ')}`);\n  if (eventsIdxSet.size > 1) warnings.push(`Mixed eventsIndex for fingerprint ${fp}: ${[...eventsIdxSet].join(', ')}`);\n\n  // merge main doc: keep the first occurrence as the base,\n  // but null-out per-occurrence HTTP fields and add aggregates.\n  const mergedMain = {\n    ...first,\n    url: null,\n    method: null,\n    param: null,\n  };\n  if (endpoints.length) mergedMain.endpoints = endpoints;\n  if (filePaths.length) mergedMain.file_paths = filePaths;\n\n  // aggregate event: keep first's basics, attach count; keep first's s3 as canonical\n  const aggEvent = {\n    '@timestamp': first['@timestamp'] || new Date().toISOString(),\n    type: 'observation',\n    fingerprint: fp,\n    tool: first.tool,\n    title: first.title,\n    severity: first.severity,\n    count: occurrences_delta,\n    s3: first.s3 || (sources.length ? sources[0] : undefined),\n  };\n\n  out.push({\n    json: {\n      fingerprint: fp,\n      now: aggEvent['@timestamp'],\n      mainIndex: groupMainIndex,\n      eventsIndex: groupEventsIndex,\n      occurrences_delta,\n      mainDoc: mergedMain,\n      eventDoc: aggEvent,\n      sources,\n      ...(warnings.length ? { warnings } : {})\n    }\n  });\n}\n\nreturn out;\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -402,13 +402,14 @@
     },
     {
       "parameters": {
-        "content": "## Parsers Available\n**Checkov**\n**Kubescape**\n**Trivy**\n**Trufflhog**\n**Zaproxy** \n\n[Guide](https://docs.n8n.io/workflows/sticky-notes/)"
+        "content": "## Parsers Available\n**Checkov**\n**Kubescape**\n**Trivy**\n**Trufflhog**\n**Zaproxy** \n\n## Webhook Body\n**{\"prefix\":\"<tool>\"}**\n\n[Guide](https://docs.n8n.io/workflows/sticky-notes/)",
+        "height": 240
       },
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
       "position": [
-        -2480,
-        176
+        -2560,
+        128
       ],
       "id": "1b50d535-1ce6-4f2a-a2eb-db4b0077d9a9",
       "name": "Sticky Note"
@@ -665,7 +666,7 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "f1fe5859-114a-4301-a78d-3bfaf19f9700",
+  "versionId": "0bd8f56a-586a-4fa6-98d6-bbcca24f3530",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "4e757bc6f0d04619b42bb59cea30c0a3b0b837b054737f030d9b19fd0d3a6fad"

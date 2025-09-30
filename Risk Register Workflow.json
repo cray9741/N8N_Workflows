@@ -415,7 +415,7 @@
       "typeVersion": 2.1,
       "position": [
         -3120,
-        192
+        184
       ],
       "id": "245b377c-a650-40ef-bd41-e82d10499f50",
       "name": "Webhook",
@@ -431,7 +431,7 @@
       "typeVersion": 3,
       "position": [
         -2672,
-        192
+        184
       ],
       "id": "e3d10624-b348-49c9-a5c2-f0a8245ff0e2",
       "name": "Loop Over Items",
@@ -445,7 +445,7 @@
       "typeVersion": 2,
       "position": [
         -2896,
-        192
+        184
       ],
       "id": "aa3d10d2-cb31-40f3-a35f-3e036eff9360",
       "name": "Apply Defaults"
@@ -495,7 +495,7 @@
       "typeVersion": 2,
       "position": [
         240,
-        192
+        184
       ],
       "id": "59c9f7d0-e7f9-46cc-950c-cc9904bb41ec",
       "name": "Next Batch"
@@ -528,7 +528,7 @@
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
-        -3072,
+        -3120,
         432
       ],
       "id": "adff8a0b-9d21-47c9-a6a0-218a576d2108",
@@ -542,7 +542,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        -2864,
+        -2896,
         432
       ],
       "id": "e8ccf548-65e9-4bb2-9ad5-b52c0953eeb4",
@@ -553,7 +553,13 @@
   "connections": {
     "Extract&Group": {
       "main": [
-        []
+        [
+          {
+            "node": "Tag Index",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Tag Index": {

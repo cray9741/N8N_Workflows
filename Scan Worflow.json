@@ -63,7 +63,7 @@
       "typeVersion": 4.2,
       "position": [
         1792,
-        88
+        96
       ],
       "id": "42bb6547-6757-4e14-ab1d-b8e1d7cf843b",
       "name": "Delete Job",
@@ -99,7 +99,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// --- INPUTS ---\n// Webhook shape: $json.body contains payload; else use $json\nconst src = $json?.body && typeof $json.body === 'object' ? $json.body : $json;\n\n// Defaults\nconst DEFAULTS = {\n  owner:     \"cray9741\",\n  repo:      \"ScanJobs\",\n  branch:    \"main\",\n  namespace: \"n8n\",\n};\n\n// Pull fields (fallback to defaults)\nlet owner     = src.owner     ?? DEFAULTS.owner;\nlet repo      = src.repo      ?? DEFAULTS.repo;\nlet branch    = src.branch    ?? DEFAULTS.branch;\nlet namespace = src.namespace ?? DEFAULTS.namespace;\n\n// Accept both `tool` and/or `tools` (string or array). Coerce to array.\nfunction coerceTools(v1, v2){\n  let parts = [];\n  const push = (v) => {\n    if (Array.isArray(v)) parts.push(...v);\n    else if (typeof v === 'string') {\n      // split on comma or whitespace, trim, drop empties\n      parts.push(...v.split(/[,\\s]+/).map(s => s.trim()).filter(Boolean));\n    }\n  };\n  push(v1); push(v2);\n  // unique + lowercase\n  parts = [...new Set(parts.map(t => String(t).toLowerCase()))];\n  // treat \"all\" specially\n  const wantsAll = parts.length === 0 || parts.includes('all');\n  return { wantsAll, tools: wantsAll ? [] : parts };\n}\nconst { wantsAll, tools } = coerceTools(src.tool, src.tools);\n\n// Normalize owner/repo if repo is \"owner/repo\" or a full URL\nfunction normalizeOwnerRepo(ownerVal, repoVal){\n  let o = ownerVal || \"\";\n  let r = (repoVal || \"\").trim();\n  if (/^https?:\\/\\/(www\\.)?github\\.com\\//i.test(r)) {\n    const path = r.replace(/^https?:\\/\\/(www\\.)?github\\.com\\//i, \"\").replace(/\\.git$/i, \"\");\n    const parts = path.split(\"/\").filter(Boolean);\n    if (parts.length >= 2) { o = parts[0]; r = parts[1]; }\n  } else if (!o && r.includes(\"/\")) {\n    const parts = r.split(\"/\").filter(Boolean);\n    if (parts.length >= 2) { o = parts[0]; r = parts[1]; }\n  }\n  if (!o || !r) throw new Error(`Missing owner/repo after normalization (owner='${o}', repo='${r}').`);\n  return { owner: o, repo: r };\n}\n({ owner, repo } = normalizeOwnerRepo(owner, repo));\n\n// Build list URL for \"deploy all\" mode\nconst scansListUrl = `https://api.github.com/repos/${owner}/${repo}/contents/Scans?ref=${encodeURIComponent(branch)}`;\n\nreturn [{\n  json: {\n    owner, repo, branch, namespace,\n    deployAll: wantsAll,        // true → list Scans/ and fan out\n    tools,                      // explicit list (if any)\n    scansListUrl\n  }\n}];\n"
+        "jsCode": "// --- INPUTS ---\n// Webhook shape: $json.body contains payload; else use $json\nconst src = $json?.query && typeof $json.query === 'object' ? $json.query : $json;\n\n// Defaults\nconst DEFAULTS = {\n  owner:     \"cray9741\",\n  repo:      \"ScanJobs\",\n  branch:    \"main\",\n  namespace: \"n8n\",\n};\n\n// Pull fields (fallback to defaults)\nlet owner     = src.owner     ?? DEFAULTS.owner;\nlet repo      = src.repo      ?? DEFAULTS.repo;\nlet branch    = src.branch    ?? DEFAULTS.branch;\nlet namespace = src.namespace ?? DEFAULTS.namespace;\n\n// Accept both `tool` and/or `tools` (string or array). Coerce to array.\nfunction coerceTools(v1, v2){\n  let parts = [];\n  const push = (v) => {\n    if (Array.isArray(v)) parts.push(...v);\n    else if (typeof v === 'string') {\n      // split on comma or whitespace, trim, drop empties\n      parts.push(...v.split(/[,\\s]+/).map(s => s.trim()).filter(Boolean));\n    }\n  };\n  push(v1); push(v2);\n  // unique + lowercase\n  parts = [...new Set(parts.map(t => String(t).toLowerCase()))];\n  // treat \"all\" specially\n  const wantsAll = parts.length === 0 || parts.includes('all');\n  return { wantsAll, tools: wantsAll ? [] : parts };\n}\nconst { wantsAll, tools } = coerceTools(src.tool, src.tools);\n\n// Normalize owner/repo if repo is \"owner/repo\" or a full URL\nfunction normalizeOwnerRepo(ownerVal, repoVal){\n  let o = ownerVal || \"\";\n  let r = (repoVal || \"\").trim();\n  if (/^https?:\\/\\/(www\\.)?github\\.com\\//i.test(r)) {\n    const path = r.replace(/^https?:\\/\\/(www\\.)?github\\.com\\//i, \"\").replace(/\\.git$/i, \"\");\n    const parts = path.split(\"/\").filter(Boolean);\n    if (parts.length >= 2) { o = parts[0]; r = parts[1]; }\n  } else if (!o && r.includes(\"/\")) {\n    const parts = r.split(\"/\").filter(Boolean);\n    if (parts.length >= 2) { o = parts[0]; r = parts[1]; }\n  }\n  if (!o || !r) throw new Error(`Missing owner/repo after normalization (owner='${o}', repo='${r}').`);\n  return { owner: o, repo: r };\n}\n({ owner, repo } = normalizeOwnerRepo(owner, repo));\n\n// Build list URL for \"deploy all\" mode\nconst scansListUrl = `https://api.github.com/repos/${owner}/${repo}/contents/Scans?ref=${encodeURIComponent(branch)}`;\n\nreturn [{\n  json: {\n    owner, repo, branch, namespace,\n    deployAll: wantsAll,        // true → list Scans/ and fan out\n    tools,                      // explicit list (if any)\n    scansListUrl\n  }\n}];\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -168,7 +168,7 @@
       "typeVersion": 1.1,
       "position": [
         2016,
-        88
+        96
       ],
       "id": "108df637-228d-4044-9b2e-950fd9468d30",
       "name": "Wait",
@@ -228,7 +228,7 @@
       "typeVersion": 4.2,
       "position": [
         448,
-        88
+        96
       ],
       "id": "b759b89c-2635-4c88-b37b-0d507b98d627",
       "name": "List Scans",
@@ -317,7 +317,7 @@
       "typeVersion": 2.2,
       "position": [
         2464,
-        88
+        96
       ],
       "id": "c8d228d5-b5b4-4754-bdd0-dd19cbb35566",
       "name": "IF — Gone yet?"
@@ -348,7 +348,7 @@
       "typeVersion": 1.2,
       "position": [
         0,
-        312
+        320
       ],
       "id": "149709e5-60f2-42a6-b870-1406585d2a9f",
       "name": "Schedule Trigger"
@@ -362,7 +362,7 @@
       "typeVersion": 4.2,
       "position": [
         224,
-        312
+        320
       ],
       "id": "ae0c4544-53b3-4436-acd2-92fd6c4954e1",
       "name": "HTTP Request"
@@ -542,7 +542,7 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "baed68d3-571f-4f9e-b7fb-811a2440da13",
+  "versionId": "6a1a154c-fdd8-4459-b700-4c78b28d0cc4",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "4e757bc6f0d04619b42bb59cea30c0a3b0b837b054737f030d9b19fd0d3a6fad"
